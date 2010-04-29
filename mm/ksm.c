@@ -179,11 +179,11 @@ static unsigned long ksm_pages_unshared;
 /* The number of rmap_items in use: to calculate pages_volatile */
 static unsigned long ksm_rmap_items;
 
-/* Number of pages ksmd should scan in one batch */
-static unsigned int ksm_thread_pages_to_scan = 100;
+/* Number of pages ksmd should scan in one batch, in ratio of millionth */
+static unsigned int ksm_scan_millionth_ratio = 100;
 
 /* Milliseconds ksmd should sleep between batches */
-static unsigned int ksm_thread_sleep_millisecs = 20;
+static unsigned int ksm_thread_sleep_mips_time = 1000;
 
 #define KSM_RUN_STOP	0
 #define KSM_RUN_MERGE	1
@@ -1385,6 +1385,16 @@ static int ksmd_should_run(void)
 	return (ksm_run & KSM_RUN_MERGE) && !list_empty(&ksm_mm_head.mm_list);
 }
 
+static inline unsigned int ksm_mips_time_to_jiffies(unsigned int mips_time)
+{
+	return mips_time * 500000  / loops_per_jiffy;
+}
+
+static inline unsigned int ksm_pages_to_scan(unsigned int millionth_ratio)
+{
+	return totalram_pages * millionth_ratio / 1000000;
+}
+
 static int ksm_scan_thread(void *nothing)
 {
 	set_user_nice(current, 5);
@@ -1392,12 +1402,12 @@ static int ksm_scan_thread(void *nothing)
 	while (!kthread_should_stop()) {
 		mutex_lock(&ksm_thread_mutex);
 		if (ksmd_should_run())
-			ksm_do_scan(ksm_thread_pages_to_scan);
+			ksm_do_scan(ksm_pages_to_scan(ksm_scan_millionth_ratio));
 		mutex_unlock(&ksm_thread_mutex);
 
 		if (ksmd_should_run()) {
 			schedule_timeout_interruptible(
-				msecs_to_jiffies(ksm_thread_sleep_millisecs));
+				ksm_mips_time_to_jiffies(ksm_thread_sleep_mips_time));
 		} else {
 			wait_event_interruptible(ksm_thread_wait,
 				ksmd_should_run() || kthread_should_stop());
@@ -1772,51 +1782,51 @@ static int ksm_memory_callback(struct notifier_block *self,
 	static struct kobj_attribute _name##_attr = \
 		__ATTR(_name, 0644, _name##_show, _name##_store)
 
-static ssize_t sleep_millisecs_show(struct kobject *kobj,
+static ssize_t sleep_mips_time_show(struct kobject *kobj,
 				    struct kobj_attribute *attr, char *buf)
 {
-	return sprintf(buf, "%u\n", ksm_thread_sleep_millisecs);
+	return sprintf(buf, "%u\n", ksm_thread_sleep_mips_time);
 }
 
-static ssize_t sleep_millisecs_store(struct kobject *kobj,
+static ssize_t sleep_mips_time_store(struct kobject *kobj,
 				     struct kobj_attribute *attr,
 				     const char *buf, size_t count)
 {
-	unsigned long msecs;
+	unsigned long nr_mips;
 	int err;
 
-	err = strict_strtoul(buf, 10, &msecs);
-	if (err || msecs > UINT_MAX)
+	err = strict_strtoul(buf, 10, &nr_mips);
+	if (err || nr_mips > UINT_MAX)
 		return -EINVAL;
 
-	ksm_thread_sleep_millisecs = msecs;
+	ksm_thread_sleep_mips_time = nr_mips;
 
 	return count;
 }
-KSM_ATTR(sleep_millisecs);
+KSM_ATTR(sleep_mips_time);
 
-static ssize_t pages_to_scan_show(struct kobject *kobj,
+static ssize_t scan_millionth_ratio_show(struct kobject *kobj,
 				  struct kobj_attribute *attr, char *buf)
 {
-	return sprintf(buf, "%u\n", ksm_thread_pages_to_scan);
+	return sprintf(buf, "%u\n", ksm_scan_millionth_ratio);
 }
 
-static ssize_t pages_to_scan_store(struct kobject *kobj,
+static ssize_t scan_millionth_ratio_store(struct kobject *kobj,
 				   struct kobj_attribute *attr,
 				   const char *buf, size_t count)
 {
 	int err;
-	unsigned long nr_pages;
+	unsigned long millionth_ratio;
 
-	err = strict_strtoul(buf, 10, &nr_pages);
-	if (err || nr_pages > UINT_MAX)
+	err = strict_strtoul(buf, 10, &millionth_ratio);
+	if (err || millionth_ratio > UINT_MAX)
 		return -EINVAL;
 
-	ksm_thread_pages_to_scan = nr_pages;
+	ksm_scan_millionth_ratio = millionth_ratio;
 
 	return count;
 }
-KSM_ATTR(pages_to_scan);
+KSM_ATTR(scan_millionth_ratio);
 
 static ssize_t run_show(struct kobject *kobj, struct kobj_attribute *attr,
 			char *buf)
@@ -1911,8 +1921,8 @@ static ssize_t full_scans_show(struct kobject *kobj,
 KSM_ATTR_RO(full_scans);
 
 static struct attribute *ksm_attrs[] = {
-	&sleep_millisecs_attr.attr,
-	&pages_to_scan_attr.attr,
+	&sleep_mips_time_attr.attr,
+	&scan_millionth_ratio_attr.attr,
 	&run_attr.attr,
 	&pages_shared_attr.attr,
 	&pages_sharing_attr.attr,
