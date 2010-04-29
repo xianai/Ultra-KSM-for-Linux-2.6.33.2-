@@ -15,6 +15,7 @@
 #include <asm/atomic.h>
 
 struct rw_semaphore;
+struct rwsem_waiter;
 
 #ifdef CONFIG_RWSEM_GENERIC_SPINLOCK
 #include <linux/rwsem-spinlock.h> /* use a generic implementation */

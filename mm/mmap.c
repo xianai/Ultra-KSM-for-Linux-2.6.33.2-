@@ -28,6 +28,7 @@
 #include <linux/rmap.h>
 #include <linux/mmu_notifier.h>
 #include <linux/perf_event.h>
+#include <linux/ksm.h>
 
 #include <asm/uaccess.h>
 #include <asm/cacheflush.h>
@@ -63,7 +64,7 @@ static void unmap_region(struct mm_struct *mm,
  * MAP_SHARED	r: (no) no	r: (yes) yes	r: (no) yes	r: (no) yes
  *		w: (no) no	w: (no) no	w: (yes) yes	w: (no) no
  *		x: (no) no	x: (no) yes	x: (no) yes	x: (yes) yes
- *		
+ *
  * MAP_PRIVATE	r: (no) no	r: (yes) yes	r: (no) yes	r: (no) yes
  *		w: (no) no	w: (no) no	w: (copy) copy	w: (no) no
  *		x: (no) no	x: (no) yes	x: (no) yes	x: (yes) yes
@@ -238,6 +239,9 @@ static struct vm_area_struct *remove_vma(struct vm_area_struct *vma)
 			removed_exe_file_vma(vma->vm_mm);
 	}
 	mpol_put(vma_policy(vma));
+#ifdef CONFIG_KSM
+	ksm_remove_vma(vma);
+#endif
 	kmem_cache_free(vm_area_cachep, vma);
 	return next;
 }
@@ -512,13 +516,27 @@ void vma_adjust(struct vm_area_struct *vma, unsigned long start,
 	long adjust_next = 0;
 	int remove_next = 0;
 
+/*
+ * to avoid deadlock, ksm_remove_vma must be done before any spin_lock is
+ * acquired
+ */
+#ifdef CONFIG_KSM
+		ksm_remove_vma(vma);
+#endif
+
+
 	if (next && !insert) {
+#ifdef CONFIG_KSM
+		ksm_remove_vma(next);
+#endif
+
 		if (end >= next->vm_end) {
 			/*
 			 * vma expands, overlapping all the next, and
 			 * perhaps the one after too (mprotect case 6).
 			 */
-again:			remove_next = 1 + (end > next->vm_end);
+again:
+			remove_next = 1 + (end > next->vm_end);
 			end = next->vm_end;
 			anon_vma = next->anon_vma;
 			importer = vma;
@@ -592,10 +610,10 @@ again:			remove_next = 1 + (end > next->vm_end);
 		if (adjust_next)
 			vma_prio_tree_remove(next, root);
 	}
-
 	vma->vm_start = start;
 	vma->vm_end = end;
 	vma->vm_pgoff = pgoff;
+
 	if (adjust_next) {
 		next->vm_start += adjust_next << PAGE_SHIFT;
 		next->vm_pgoff += adjust_next;
@@ -648,9 +666,21 @@ again:			remove_next = 1 + (end > next->vm_end);
 		 */
 		if (remove_next == 2) {
 			next = vma->vm_next;
+#ifdef CONFIG_KSM
+			ksm_remove_vma(next);
+#endif
 			goto again;
 		}
+	} else {
+#ifdef CONFIG_KSM
+		if (next && !insert)
+			ksm_vma_add_new(next);
+#endif
 	}
+
+#ifdef CONFIG_KSM
+	ksm_vma_add_new(vma);
+#endif
 
 	validate_mm(mm);
 }
@@ -1205,6 +1235,9 @@ munmap_back:
 	vma->vm_flags = vm_flags;
 	vma->vm_page_prot = vm_get_page_prot(vm_flags);
 	vma->vm_pgoff = pgoff;
+#ifdef CONFIG_KSM
+		ksm_vma_add_new(vma);
+#endif
 
 	if (file) {
 		error = -EINVAL;
@@ -1286,6 +1319,9 @@ unmap_and_free_vma:
 	unmap_region(mm, vma, prev, vma->vm_start, vma->vm_end);
 	charged = 0;
 free_vma:
+#ifdef CONFIG_KSM
+	ksm_remove_vma(vma);
+#endif
 	kmem_cache_free(vm_area_cachep, vma);
 unacct_error:
 	if (charged)
@@ -1361,7 +1397,7 @@ full_search:
 		addr = vma->vm_end;
 	}
 }
-#endif	
+#endif
 
 void arch_unmap_area(struct mm_struct *mm, unsigned long addr)
 {
@@ -1723,8 +1759,15 @@ static int expand_downwards(struct vm_area_struct *vma,
 
 		error = acct_stack_growth(vma, size, grow);
 		if (!error) {
+#ifdef CONFIG_KSM
+		ksm_remove_vma(vma);
+#endif
 			vma->vm_start = address;
 			vma->vm_pgoff -= grow;
+#ifdef CONFIG_KSM
+		ksm_vma_add_new(vma);
+#endif
+
 		}
 	}
 	anon_vma_unlock(vma);
@@ -1889,6 +1932,9 @@ static int __split_vma(struct mm_struct * mm, struct vm_area_struct * vma,
 		new->vm_start = addr;
 		new->vm_pgoff += ((addr - vma->vm_start) >> PAGE_SHIFT);
 	}
+#ifdef CONFIG_KSM
+		ksm_vma_add_new(new);
+#endif
 
 	pol = mpol_dup(vma_policy(vma));
 	if (IS_ERR(pol)) {
@@ -2128,6 +2174,9 @@ unsigned long do_brk(unsigned long addr, unsigned long len)
 	vma->vm_pgoff = pgoff;
 	vma->vm_flags = flags;
 	vma->vm_page_prot = vm_get_page_prot(flags);
+#ifdef CONFIG_KSM
+		ksm_vma_add_new(vma);
+#endif
 	vma_link(mm, vma, prev, rb_link, rb_parent);
 out:
 	mm->total_vm += len >> PAGE_SHIFT;
@@ -2273,6 +2322,9 @@ struct vm_area_struct *copy_vma(struct vm_area_struct **vmap,
 			}
 			if (new_vma->vm_ops && new_vma->vm_ops->open)
 				new_vma->vm_ops->open(new_vma);
+#ifdef CONFIG_KSM
+			ksm_vma_add_new(new_vma);
+#endif
 			vma_link(mm, new_vma, prev, rb_link, rb_parent);
 		}
 	}
@@ -2363,7 +2415,9 @@ int install_special_mapping(struct mm_struct *mm,
 
 	vma->vm_ops = &special_mapping_vmops;
 	vma->vm_private_data = pages;
-
+#ifdef CONFIG_KSM
+	ksm_vma_add_new(vma);
+#endif
 	if (unlikely(insert_vm_struct(mm, vma))) {
 		kmem_cache_free(vm_area_cachep, vma);
 		return -ENOMEM;

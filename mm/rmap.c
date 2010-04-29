@@ -676,8 +676,11 @@ void page_add_anon_rmap(struct page *page,
 	int first = atomic_inc_and_test(&page->_mapcount);
 	if (first)
 		__inc_zone_page_state(page, NR_ANON_PAGES);
-	if (unlikely(PageKsm(page)))
+	if (unlikely(PageKsm(page))) {
+		if (!first)
+			__inc_zone_page_state(page, NR_KSM_PAGES_SHARING);
 		return;
+	}
 
 	VM_BUG_ON(!PageLocked(page));
 	VM_BUG_ON(address < vma->vm_start || address >= vma->vm_end);
@@ -734,8 +737,12 @@ void page_add_file_rmap(struct page *page)
 void page_remove_rmap(struct page *page)
 {
 	/* page still mapped by someone else? */
-	if (!atomic_add_negative(-1, &page->_mapcount))
+	if (!atomic_add_negative(-1, &page->_mapcount)){
+		if (PageKsm(page)) {
+			__dec_zone_page_state(page, NR_KSM_PAGES_SHARING);
+		}
 		return;
+	}
 
 	/*
 	 * Now that the last pte has gone, s390 must transfer dirty
