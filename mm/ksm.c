@@ -117,6 +117,7 @@ struct stable_node {
 	struct rb_node node;
 	struct hlist_head hlist;
 	unsigned long kpfn;
+	u32 checksum;
 };
 
 /**
@@ -963,7 +964,7 @@ static struct page *try_to_merge_two_pages(struct rmap_item *rmap_item,
  * This function returns the stable tree node of identical content if found,
  * NULL otherwise.
  */
-static struct page *stable_tree_search(struct page *page)
+static struct page *stable_tree_search(struct page *page, u32 checksum)
 {
 	struct rb_node *node = root_stable_tree.rb_node;
 	struct stable_node *stable_node;
@@ -980,16 +981,17 @@ static struct page *stable_tree_search(struct page *page)
 
 		cond_resched();
 		stable_node = rb_entry(node, struct stable_node, node);
+
 		tree_page = get_ksm_page(stable_node);
 		if (!tree_page)
 			return NULL;
 
-		ret = memcmp_pages(page, tree_page);
+		//ret = memcmp_pages(page, tree_page);
 
-		if (ret < 0) {
+		if (checksum < stable_node->checksum) {
 			put_page(tree_page);
 			node = node->rb_left;
-		} else if (ret > 0) {
+		} else if (checksum > stable_node->checksum) {
 			put_page(tree_page);
 			node = node->rb_right;
 		} else
@@ -1011,6 +1013,10 @@ static struct stable_node *stable_tree_insert(struct page *kpage)
 	struct rb_node **new = &root_stable_tree.rb_node;
 	struct rb_node *parent = NULL;
 	struct stable_node *stable_node;
+	u32 checksum;
+
+	/* now it's write_protected, re-calc checksum */
+	checksum = calc_checksum(kpage);
 
 	while (*new) {
 		struct page *tree_page;
@@ -1018,25 +1024,37 @@ static struct stable_node *stable_tree_insert(struct page *kpage)
 
 		cond_resched();
 		stable_node = rb_entry(*new, struct stable_node, node);
+/*
 		tree_page = get_ksm_page(stable_node);
 		if (!tree_page)
 			return NULL;
 
 		ret = memcmp_pages(kpage, tree_page);
 		put_page(tree_page);
-
+*/
 		parent = *new;
-		if (ret < 0)
+		if (checksum < stable_node->checksum)
 			new = &parent->rb_left;
-		else if (ret > 0)
+		else if (checksum > stable_node->checksum)
 			new = &parent->rb_right;
 		else {
 			/*
 			 * It is not a bug that stable_tree_search() didn't
 			 * find this node: because at that time our page was
-			 * not yet write-protected, so may have changed since.
+ 			   not yet write-protected, so may have changed since.
+ 			   In addition, we must check if it's a hash collision.
 			 */
-			return NULL;
+			tree_page = get_ksm_page(stable_node);
+			if (!tree_page)
+				return NULL;
+
+			ret = memcmp_pages(kpage, tree_page);
+			put_page(tree_page);
+
+			if (!ret)
+				return NULL;
+			else
+				BUG(); /* TODO: deal with hash collision*/
 		}
 	}
 
@@ -1050,6 +1068,7 @@ static struct stable_node *stable_tree_insert(struct page *kpage)
 	INIT_HLIST_HEAD(&stable_node->hlist);
 
 	stable_node->kpfn = page_to_pfn(kpage);
+	stable_node->checksum = checksum;
 	set_page_stable_node(kpage, stable_node);
 
 	return stable_node;
@@ -1072,7 +1091,8 @@ static struct stable_node *stable_tree_insert(struct page *kpage)
 static
 struct rmap_item *unstable_tree_search_insert(struct rmap_item *rmap_item,
 					      struct page *page,
-					      struct page **tree_pagep)
+					      struct page **tree_pagep,
+					      u32 checksum)
 
 {
 	struct rb_node **new = &root_unstable_tree.rb_node;
@@ -1097,13 +1117,13 @@ struct rmap_item *unstable_tree_search_insert(struct rmap_item *rmap_item,
 			return NULL;
 		}
 
-		ret = memcmp_pages(page, tree_page);
+		//ret = memcmp_pages(page, tree_page);
 
 		parent = *new;
-		if (ret < 0) {
+		if (checksum < tree_rmap_item->oldchecksum) {
 			put_page(tree_page);
 			new = &parent->rb_left;
-		} else if (ret > 0) {
+		} else if (checksum > tree_rmap_item->oldchecksum) {
 			put_page(tree_page);
 			new = &parent->rb_right;
 		} else {
@@ -1159,8 +1179,9 @@ static void cmp_and_merge_page(struct page *page, struct rmap_item *rmap_item)
 
 	remove_rmap_item_from_tree(rmap_item);
 
+	checksum = calc_checksum(page);
 	/* We first start with searching the page inside the stable tree */
-	kpage = stable_tree_search(page);
+	kpage = stable_tree_search(page, checksum);
 	if (kpage) {
 		err = try_to_merge_with_ksm_page(rmap_item, page, kpage);
 		if (!err) {
@@ -1182,14 +1203,13 @@ static void cmp_and_merge_page(struct page *page, struct rmap_item *rmap_item)
 	 * don't want to insert it in the unstable tree, and we don't want
 	 * to waste our time searching for something identical to it there.
 	 */
-	checksum = calc_checksum(page);
 	if (rmap_item->oldchecksum != checksum) {
 		rmap_item->oldchecksum = checksum;
 		return;
 	}
 
 	tree_rmap_item =
-		unstable_tree_search_insert(rmap_item, page, &tree_page);
+		unstable_tree_search_insert(rmap_item, page, &tree_page, checksum);
 	if (tree_rmap_item) {
 		kpage = try_to_merge_two_pages(rmap_item, page,
 						tree_rmap_item, tree_page);
