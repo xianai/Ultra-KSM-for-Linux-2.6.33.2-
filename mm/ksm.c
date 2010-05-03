@@ -191,6 +191,8 @@ static unsigned int ksm_thread_sleep_mips_time = 1000;
 #define KSM_RUN_UNMERGE	2
 static unsigned int ksm_run = KSM_RUN_STOP;
 
+static unsigned int ksm_enable_full_scan = 0;
+
 static DECLARE_WAIT_QUEUE_HEAD(ksm_thread_wait);
 static DEFINE_MUTEX(ksm_thread_mutex);
 static DEFINE_SPINLOCK(ksm_mmlist_lock);
@@ -977,7 +979,6 @@ static struct page *stable_tree_search(struct page *page, u32 checksum)
 
 	while (node) {
 		struct page *tree_page;
-		int ret;
 
 		cond_resched();
 		stable_node = rb_entry(node, struct stable_node, node);
@@ -1101,7 +1102,6 @@ struct rmap_item *unstable_tree_search_insert(struct rmap_item *rmap_item,
 	while (*new) {
 		struct rmap_item *tree_rmap_item;
 		struct page *tree_page;
-		int ret;
 
 		cond_resched();
 		tree_rmap_item = rb_entry(*new, struct rmap_item, node);
@@ -1296,6 +1296,9 @@ next_mm:
 	}
 
 	mm = slot->mm;
+
+//	printk(KERN_ERR "scanning task %s\n", mm->owner->comm);
+
 	down_read(&mm->mmap_sem);
 	if (ksm_test_exit(mm))
 		vma = NULL;
@@ -1489,7 +1492,7 @@ int __ksm_enter(struct mm_struct *mm)
 		return -ENOMEM;
 
 	/* Check ksm_run too?  Would need tighter locking */
-	needs_wakeup = list_empty(&ksm_mm_head.mm_list);
+//	needs_wakeup = list_empty(&ksm_mm_head.mm_list);
 
 	spin_lock(&ksm_mmlist_lock);
 	insert_to_mm_slots_hash(mm, mm_slot);
@@ -1504,8 +1507,8 @@ int __ksm_enter(struct mm_struct *mm)
 	set_bit(MMF_VM_MERGEABLE, &mm->flags);
 	atomic_inc(&mm->mm_count);
 
-	if (needs_wakeup)
-		wake_up_interruptible(&ksm_thread_wait);
+//	if (needs_wakeup)
+//		wake_up_interruptible(&ksm_thread_wait);
 
 	return 0;
 }
@@ -1940,6 +1943,115 @@ static ssize_t full_scans_show(struct kobject *kobj,
 }
 KSM_ATTR_RO(full_scans);
 
+
+
+static void change_process_vmas(struct mm_struct *mm)
+{
+	struct vm_area_struct *vma;
+
+	if (!mm)
+		return;
+
+//	printk(KERN_ERR "Adding task %s\n", mm->owner->comm);
+
+	down_write(&mm->mmap_sem);
+	vma = mm->mmap;
+	for (; vma; vma = vma->vm_next) {
+		/*
+		 * Be somewhat over-protective for now!
+		 */
+		if (vma->vm_flags & (VM_MERGEABLE | VM_PFNMAP
+				     | VM_IO      | VM_DONTEXPAND |
+				 VM_RESERVED  | VM_HUGETLB | VM_INSERTPAGE |
+				 VM_NONLINEAR | VM_MIXEDMAP | VM_SAO))
+			continue;		/* just ignore */
+
+		vma->vm_flags |= VM_MERGEABLE;
+	}
+
+	up_write(&mm->mmap_sem);
+}
+
+
+static ssize_t enable_full_memory_scan_show(struct kobject *kobj,
+				  struct kobj_attribute *attr, char *buf)
+{
+	return sprintf(buf, "%u\n", ksm_enable_full_scan);
+}
+
+
+/*
+ * 0 -> 1: add all tasks' mm to ksm list
+ * 1 -> 0: do the same like KSM_RUN_UNMERGE
+ */
+static ssize_t enable_full_memory_scan_store(struct kobject *kobj,
+				   struct kobj_attribute *attr,
+				   const char *buf, size_t count)
+{
+	int err;
+	unsigned long enable_full_scan;
+	struct task_struct *p;
+	struct mm_struct *mm;
+
+	err = strict_strtoul(buf, 10, &enable_full_scan);
+	if (err || enable_full_scan > UINT_MAX)
+		return -EINVAL;
+
+	if (enable_full_scan == ksm_enable_full_scan)
+		return count;
+
+	ksm_enable_full_scan = enable_full_scan;
+
+	if (!enable_full_scan) {
+		mutex_lock(&ksm_thread_mutex);
+		current->flags |= PF_OOM_ORIGIN;
+		err = unmerge_and_remove_all_rmap_items();
+		current->flags &= ~PF_OOM_ORIGIN;
+		if (err) count = err;
+
+		ksm_run = KSM_RUN_STOP;
+		mutex_unlock(&ksm_thread_mutex);
+	} else {
+		read_lock(&tasklist_lock);
+		//
+		//p = next_task(&init_task);
+
+		for_each_process(p) {
+			if (!p->mm || p->flags & PF_KTHREAD ||
+			    test_bit(MMF_VM_MERGEABLE, &p->mm->flags))
+				continue;
+
+			get_task_struct(p);
+			mm = get_task_mm(p);
+			read_unlock(&tasklist_lock);
+
+			if (mm) {
+				/* TODO: dynamically insert new mm
+				 * and check if the mm is already inserted
+				 * by insert_to_mm_slots_hash_unique
+				 * and periodically check if new process has
+				 * been created.
+				 */
+				err = __ksm_enter(p->mm);
+				if (err) {
+					printk(KERN_ERR "ksm_enter failure\n");
+					count = err;
+				} else
+					change_process_vmas(mm);
+				mmput(mm);
+			}
+			read_lock(&tasklist_lock);
+			put_task_struct(p);
+		}
+		read_unlock(&tasklist_lock);
+	}
+
+
+	return count;
+}
+KSM_ATTR(enable_full_memory_scan);
+
+
 static struct attribute *ksm_attrs[] = {
 	&sleep_mips_time_attr.attr,
 	&scan_millionth_ratio_attr.attr,
@@ -1949,6 +2061,7 @@ static struct attribute *ksm_attrs[] = {
 	&pages_unshared_attr.attr,
 	&pages_volatile_attr.attr,
 	&full_scans_attr.attr,
+	&enable_full_memory_scan_attr.attr,
 	NULL,
 };
 
