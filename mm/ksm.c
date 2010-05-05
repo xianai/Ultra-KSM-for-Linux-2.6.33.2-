@@ -1257,6 +1257,8 @@ static struct rmap_item *get_next_rmap_item(struct mm_slot *mm_slot,
 		if (rmap_item->address > addr)
 			break;
 		*rmap_list = rmap_item->rmap_list;
+
+		/* some pages may be nulled since last scan */
 		remove_rmap_item_from_tree(rmap_item);
 		free_rmap_item(rmap_item);
 	}
@@ -1405,7 +1407,8 @@ static void ksm_do_scan(unsigned int scan_npages)
 
 static int ksmd_should_run(void)
 {
-	return (ksm_run & KSM_RUN_MERGE) && !list_empty(&ksm_mm_head.mm_list);
+	return (ksm_run & KSM_RUN_MERGE) &&
+		(!list_empty(&ksm_mm_head.mm_list) || ksm_enable_full_scan);
 }
 
 static inline unsigned int ksm_mips_time_to_jiffies(unsigned int mips_time)
@@ -1418,11 +1421,76 @@ static inline unsigned int ksm_pages_to_scan(unsigned int millionth_ratio)
 	return totalram_pages * millionth_ratio / 1000000;
 }
 
+static void change_process_vmas(struct mm_struct *mm)
+{
+	struct vm_area_struct *vma;
+
+	if (!mm)
+		return;
+
+//	printk(KERN_ERR "Adding new task %s\n", mm->owner->comm);
+
+	down_write(&mm->mmap_sem);
+	vma = mm->mmap;
+	for (; vma; vma = vma->vm_next) {
+		/*
+		 * Be somewhat over-protective for now!
+		 */
+		if (vma->vm_flags & (VM_MERGEABLE | VM_PFNMAP
+				     | VM_IO      | VM_DONTEXPAND |
+				 VM_RESERVED  | VM_HUGETLB | VM_INSERTPAGE |
+				 VM_NONLINEAR | VM_MIXEDMAP | VM_SAO))
+			continue;		/* just ignore */
+
+		vma->vm_flags |= VM_MERGEABLE;
+	}
+
+	up_write(&mm->mmap_sem);
+}
+
+static void try_ksm_enter_all_process(void)
+{
+	struct mm_struct *mm;
+	struct task_struct *p;
+	int err;
+
+	read_lock(&tasklist_lock);
+
+	for_each_process(p) {
+		if (!p->mm || p->flags & PF_KTHREAD ||
+		    test_bit(MMF_VM_MERGEABLE, &p->mm->flags))
+			continue;
+
+		get_task_struct(p);
+		mm = get_task_mm(p);
+		read_unlock(&tasklist_lock);
+
+		if (mm) {
+			err = __ksm_enter(p->mm);
+			if (err) {
+				printk(KERN_ERR "ksm_enter failure\n");
+			} else
+				change_process_vmas(mm);
+			mmput(mm);
+		}
+		read_lock(&tasklist_lock);
+		put_task_struct(p);
+	}
+
+	read_unlock(&tasklist_lock);
+
+	return;
+}
+
 static int ksm_scan_thread(void *nothing)
 {
 	set_user_nice(current, 5);
 
 	while (!kthread_should_stop()) {
+		if (ksm_enable_full_scan) {
+			try_ksm_enter_all_process();
+		}
+
 		mutex_lock(&ksm_thread_mutex);
 		if (ksmd_should_run())
 			ksm_do_scan(ksm_pages_to_scan(ksm_scan_millionth_ratio));
@@ -1944,41 +2012,11 @@ static ssize_t full_scans_show(struct kobject *kobj,
 KSM_ATTR_RO(full_scans);
 
 
-
-static void change_process_vmas(struct mm_struct *mm)
-{
-	struct vm_area_struct *vma;
-
-	if (!mm)
-		return;
-
-//	printk(KERN_ERR "Adding task %s\n", mm->owner->comm);
-
-	down_write(&mm->mmap_sem);
-	vma = mm->mmap;
-	for (; vma; vma = vma->vm_next) {
-		/*
-		 * Be somewhat over-protective for now!
-		 */
-		if (vma->vm_flags & (VM_MERGEABLE | VM_PFNMAP
-				     | VM_IO      | VM_DONTEXPAND |
-				 VM_RESERVED  | VM_HUGETLB | VM_INSERTPAGE |
-				 VM_NONLINEAR | VM_MIXEDMAP | VM_SAO))
-			continue;		/* just ignore */
-
-		vma->vm_flags |= VM_MERGEABLE;
-	}
-
-	up_write(&mm->mmap_sem);
-}
-
-
 static ssize_t enable_full_memory_scan_show(struct kobject *kobj,
 				  struct kobj_attribute *attr, char *buf)
 {
 	return sprintf(buf, "%u\n", ksm_enable_full_scan);
 }
-
 
 /*
  * 0 -> 1: add all tasks' mm to ksm list
@@ -1990,8 +2028,6 @@ static ssize_t enable_full_memory_scan_store(struct kobject *kobj,
 {
 	int err;
 	unsigned long enable_full_scan;
-	struct task_struct *p;
-	struct mm_struct *mm;
 
 	err = strict_strtoul(buf, 10, &enable_full_scan);
 	if (err || enable_full_scan > UINT_MAX)
@@ -2011,41 +2047,7 @@ static ssize_t enable_full_memory_scan_store(struct kobject *kobj,
 
 		ksm_run = KSM_RUN_STOP;
 		mutex_unlock(&ksm_thread_mutex);
-	} else {
-		read_lock(&tasklist_lock);
-		//
-		//p = next_task(&init_task);
-
-		for_each_process(p) {
-			if (!p->mm || p->flags & PF_KTHREAD ||
-			    test_bit(MMF_VM_MERGEABLE, &p->mm->flags))
-				continue;
-
-			get_task_struct(p);
-			mm = get_task_mm(p);
-			read_unlock(&tasklist_lock);
-
-			if (mm) {
-				/* TODO: dynamically insert new mm
-				 * and check if the mm is already inserted
-				 * by insert_to_mm_slots_hash_unique
-				 * and periodically check if new process has
-				 * been created.
-				 */
-				err = __ksm_enter(p->mm);
-				if (err) {
-					printk(KERN_ERR "ksm_enter failure\n");
-					count = err;
-				} else
-					change_process_vmas(mm);
-				mmput(mm);
-			}
-			read_lock(&tasklist_lock);
-			put_task_struct(p);
-		}
-		read_unlock(&tasklist_lock);
 	}
-
 
 	return count;
 }
