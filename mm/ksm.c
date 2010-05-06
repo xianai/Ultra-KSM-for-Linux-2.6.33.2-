@@ -1274,6 +1274,17 @@ static struct rmap_item *get_next_rmap_item(struct mm_slot *mm_slot,
 	return rmap_item;
 }
 
+static inline int vma_need_scan(struct vm_area_struct *vma)
+{
+	if (ksm_enable_full_scan && !(vma->vm_flags & (VM_PFNMAP | VM_IO  | VM_DONTEXPAND |
+				 VM_RESERVED  | VM_HUGETLB | VM_INSERTPAGE |
+				 VM_NONLINEAR | VM_MIXEDMAP | VM_SAO))) {
+		vma->vm_flags |= VM_MERGEABLE;
+	}
+
+	return vma->vm_flags & VM_MERGEABLE;
+}
+
 static struct rmap_item *scan_get_next_rmap_item(struct page **page)
 {
 	struct mm_struct *mm;
@@ -1308,7 +1319,7 @@ next_mm:
 		vma = find_vma(mm, ksm_scan.address);
 
 	for (; vma; vma = vma->vm_next) {
-		if (!(vma->vm_flags & VM_MERGEABLE))
+		if (!vma_need_scan(vma))
 			continue;
 		if (ksm_scan.address < vma->vm_start)
 			ksm_scan.address = vma->vm_start;
