@@ -366,7 +366,7 @@ static int break_ksm(struct vm_area_struct *vma, unsigned long addr)
 	int ret = 0;
 
 	do {
-		cond_resched();
+		//cond_resched();
 		page = follow_page(vma, addr, FOLL_GET);
 		if (!page)
 			break;
@@ -475,7 +475,7 @@ static void remove_node_from_stable_tree(struct stable_node *stable_node)
 			ksm_pages_shared--;
 		drop_anon_vma(rmap_item);
 		rmap_item->address &= PAGE_MASK;
-		cond_resched();
+		//cond_resched();
 	}
 
 	rb_erase(&stable_node->node, &root_stable_tree);
@@ -582,7 +582,8 @@ static void remove_rmap_item_from_tree(struct rmap_item *rmap_item)
 		rmap_item->address &= PAGE_MASK;
 	}
 out:
-	cond_resched();		/* we're called from many long loops */
+	//cond_resched();		/* we're called from many long loops */
+	return;
 }
 
 static void remove_trailing_rmap_items(struct mm_slot *mm_slot,
@@ -1034,7 +1035,7 @@ static struct page *stable_tree_search(struct page *page, u32 checksum)
 	while (node) {
 		struct page *tree_page;
 
-		cond_resched();
+		//cond_resched();
 		stable_node = rb_entry(node, struct stable_node, node);
 
 		tree_page = get_ksm_page(stable_node);
@@ -1077,7 +1078,7 @@ static struct stable_node *stable_tree_insert(struct page *kpage)
 		struct page *tree_page;
 		int ret;
 
-		cond_resched();
+		//cond_resched();
 		stable_node = rb_entry(*new, struct stable_node, node);
 /*
 		tree_page = get_ksm_page(stable_node);
@@ -1157,7 +1158,7 @@ struct rmap_item *unstable_tree_search_insert(struct rmap_item *rmap_item,
 		struct rmap_item *tree_rmap_item;
 		struct page *tree_page;
 
-		cond_resched();
+		//cond_resched();
 		tree_rmap_item = rb_entry(*new, struct rmap_item, node);
 		tree_page = get_mergeable_page(tree_rmap_item);
 		if (!tree_page)
@@ -1401,7 +1402,7 @@ next_mm:
 			if (*page)
 				put_page(*page);
 			ksm_scan.address += PAGE_SIZE;
-			cond_resched();
+			//cond_resched();
 		}
 	}
 
@@ -1460,7 +1461,7 @@ static void ksm_do_scan(unsigned int scan_npages)
 	struct page *page;
 
 	while (scan_npages--) {
-		cond_resched();
+		//cond_resched();
 		rmap_item = scan_get_next_rmap_item(&page);
 		if (!rmap_item)
 			return;
