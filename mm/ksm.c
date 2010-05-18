@@ -33,9 +33,20 @@
 #include <linux/mmu_notifier.h>
 #include <linux/swap.h>
 #include <linux/ksm.h>
+#include <linux/crypto.h>
+#include <linux/scatterlist.h>
+#include <crypto/hash.h>
 
 #include <asm/tlbflush.h>
 #include "internal.h"
+
+//#define CONFIG_KSM_SHA1 1
+
+#ifdef CONFIG_KSM_SHA1
+#define KSM_CHECKSUM_SIZE	5
+#else
+#define KSM_CHECKSUM_SIZE	1
+#endif
 
 /*
  * A few notes about the KSM scanning process,
@@ -117,7 +128,7 @@ struct stable_node {
 	struct rb_node node;
 	struct hlist_head hlist;
 	unsigned long kpfn;
-	u32 checksum;
+	u32 checksum[KSM_CHECKSUM_SIZE];
 };
 
 /**
@@ -136,7 +147,7 @@ struct rmap_item {
 	struct anon_vma *anon_vma;	/* when stable */
 	struct mm_struct *mm;
 	unsigned long address;		/* + low bits used for flags below */
-	unsigned int oldchecksum;	/* when unstable */
+	u32 oldchecksum[KSM_CHECKSUM_SIZE];	/* when unstable */
 	union {
 		struct rb_node node;	/* when node of unstable tree */
 		struct {		/* when listed from stable tree */
@@ -196,6 +207,11 @@ static unsigned int ksm_enable_full_scan = 0;
 static DECLARE_WAIT_QUEUE_HEAD(ksm_thread_wait);
 static DEFINE_MUTEX(ksm_thread_mutex);
 static DEFINE_SPINLOCK(ksm_mmlist_lock);
+
+#ifdef CONFIG_KSM_SHA1
+/* for crypto hash functions */
+static struct crypto_hash *ksm_hash_tfm;
+#endif
 
 #define KSM_KMEM_CACHE(__struct, __flags) kmem_cache_create("ksm_"#__struct,\
 		sizeof(struct __struct), __alignof__(struct __struct),\
@@ -695,7 +711,8 @@ error:
                        +(uint32_t)(((const uint8_t *)(d))[0]) )
 #endif
 
-uint32_t SuperFastHash (const char * data, int len) {
+#ifdef CONFIG_KSM_SUPERFASTHASH
+static uint32_t SuperFastHash (const char * data, int len) {
 	uint32_t hash = len, tmp;
 	int rem;
 
@@ -739,18 +756,38 @@ uint32_t SuperFastHash (const char * data, int len) {
 
 	return hash;
 }
+#endif
 
-
-static u32 calc_checksum(struct page *page)
+static void calc_checksum(struct page *page, u32 *checksum)
 {
-	u32 checksum;
-	void *addr = kmap_atomic(page, KM_USER0);
-	//checksum = jhash2(addr, PAGE_SIZE / 4, 17);
 
-	checksum = SuperFastHash(addr, PAGE_SIZE);
+
+#ifdef CONFIG_KSM_SHA1
+	struct hash_desc desc;
+	struct scatterlist sg[1];
+
+	sg_init_table(sg, 1);
+	sg_set_page(sg, page, PAGE_SIZE, 0);
+
+	desc.tfm = ksm_hash_tfm;
+	desc.flags = 0;
+	if (crypto_hash_digest(&desc, sg, PAGE_SIZE, (u8*)checksum)) {
+		printk(KERN_ERR "Ksm hash digest failed\n");
+	}
+#else
+	//checksum = jhash2(addr, PAGE_SIZE / 4, 17);
+	void *addr = kmap_atomic(page, KM_USER0);
+
+#ifdef CONFIG_KSM_SUPERFASTHASH
+	*checksum = SuperFastHash(addr, PAGE_SIZE);
+#else
+	*checksum = jhash2(addr, PAGE_SIZE / 4, 17);
+#endif
 
 	kunmap_atomic(addr, KM_USER0);
-	return checksum;
+#endif
+
+	return;
 }
 
 static int memcmp_pages(struct page *page1, struct page *page2)
@@ -1012,6 +1049,40 @@ static struct page *try_to_merge_two_pages(struct rmap_item *rmap_item,
 	return err ? NULL : page;
 }
 
+
+static int checksum_compare(u32 *c1, u32 *c2)
+{
+#ifdef CONFIG_KSM_SHA1
+	int i = 0;
+	while ((c1[i] == c2[i]) && (i < 5))
+		i++;
+
+	if (i >= 5)
+		return 0;
+	else if(c1[i] > c2[i])
+		return 1;
+	else
+		return -1;
+#else
+	if (*c1 > *c2)
+		return 1;
+	else if (*c1 < *c2)
+		return -1;
+	else
+		return 0;
+#endif
+}
+
+static inline void checksum_copy2(u32 *src, u32 *dst)
+{
+	int i;
+
+	for (i = 0; i < KSM_CHECKSUM_SIZE; i++) {
+		dst[i] = src[i];
+	}
+	return;
+}
+
 /*
  * stable_tree_search - search for page inside the stable tree
  *
@@ -1021,7 +1092,7 @@ static struct page *try_to_merge_two_pages(struct rmap_item *rmap_item,
  * This function returns the stable tree node of identical content if found,
  * NULL otherwise.
  */
-static struct page *stable_tree_search(struct page *page, u32 checksum)
+static struct page *stable_tree_search(struct page *page, u32 *checksum)
 {
 	struct rb_node *node = root_stable_tree.rb_node;
 	struct stable_node *stable_node;
@@ -1034,6 +1105,7 @@ static struct page *stable_tree_search(struct page *page, u32 checksum)
 
 	while (node) {
 		struct page *tree_page;
+		int cmp;
 
 		//cond_resched();
 		stable_node = rb_entry(node, struct stable_node, node);
@@ -1043,11 +1115,12 @@ static struct page *stable_tree_search(struct page *page, u32 checksum)
 			return NULL;
 
 		//ret = memcmp_pages(page, tree_page);
+		cmp = checksum_compare(checksum, stable_node->checksum);
 
-		if (checksum < stable_node->checksum) {
+		if (cmp < 0) {
 			put_page(tree_page);
 			node = node->rb_left;
-		} else if (checksum > stable_node->checksum) {
+		} else if (cmp > 0) {
 			put_page(tree_page);
 			node = node->rb_right;
 		} else
@@ -1069,29 +1142,31 @@ static struct stable_node *stable_tree_insert(struct page *kpage)
 	struct rb_node **new = &root_stable_tree.rb_node;
 	struct rb_node *parent = NULL;
 	struct stable_node *stable_node;
-	u32 checksum;
+	u32 checksum[KSM_CHECKSUM_SIZE];
 
 	/* now it's write_protected, re-calc checksum */
-	checksum = calc_checksum(kpage);
+	calc_checksum(kpage, checksum);
 
 	while (*new) {
 		struct page *tree_page;
-		int ret;
+		int cmp, ret;
 
-		//cond_resched();
+		cond_resched();
 		stable_node = rb_entry(*new, struct stable_node, node);
-/*
+
 		tree_page = get_ksm_page(stable_node);
 		if (!tree_page)
 			return NULL;
 
-		ret = memcmp_pages(kpage, tree_page);
-		put_page(tree_page);
-*/
+		//ret = memcmp_pages(kpage, tree_page);
+		//put_page(tree_page);
+
+		cmp = checksum_compare(checksum, stable_node->checksum);
+
 		parent = *new;
-		if (checksum < stable_node->checksum)
+		if (cmp < 0)
 			new = &parent->rb_left;
-		else if (checksum > stable_node->checksum)
+		else if (cmp > 0)
 			new = &parent->rb_right;
 		else {
 			/*
@@ -1100,18 +1175,19 @@ static struct stable_node *stable_tree_insert(struct page *kpage)
  			   not yet write-protected, so may have changed since.
  			   In addition, we must check if it's a hash collision.
 			 */
-			tree_page = get_ksm_page(stable_node);
-			if (!tree_page)
-				return NULL;
+			//tree_page = get_ksm_page(stable_node);
+			//if (!tree_page)
+			//	return NULL;
 
 			ret = memcmp_pages(kpage, tree_page);
-			put_page(tree_page);
+			//put_page(tree_page);
 
 			if (!ret)
 				return NULL;
 			else
 				BUG(); /* TODO: deal with hash collision*/
 		}
+		put_page(tree_page);
 	}
 
 	stable_node = alloc_stable_node();
@@ -1124,7 +1200,7 @@ static struct stable_node *stable_tree_insert(struct page *kpage)
 	INIT_HLIST_HEAD(&stable_node->hlist);
 
 	stable_node->kpfn = page_to_pfn(kpage);
-	stable_node->checksum = checksum;
+	checksum_copy2(checksum, stable_node->checksum);
 	set_page_stable_node(kpage, stable_node);
 
 	return stable_node;
@@ -1148,7 +1224,7 @@ static
 struct rmap_item *unstable_tree_search_insert(struct rmap_item *rmap_item,
 					      struct page *page,
 					      struct page **tree_pagep,
-					      u32 checksum)
+					      u32 *checksum)
 
 {
 	struct rb_node **new = &root_unstable_tree.rb_node;
@@ -1157,6 +1233,7 @@ struct rmap_item *unstable_tree_search_insert(struct rmap_item *rmap_item,
 	while (*new) {
 		struct rmap_item *tree_rmap_item;
 		struct page *tree_page;
+		int cmp;
 
 		//cond_resched();
 		tree_rmap_item = rb_entry(*new, struct rmap_item, node);
@@ -1173,12 +1250,13 @@ struct rmap_item *unstable_tree_search_insert(struct rmap_item *rmap_item,
 		}
 
 		//ret = memcmp_pages(page, tree_page);
+		cmp = checksum_compare(checksum, tree_rmap_item->oldchecksum);
 
 		parent = *new;
-		if (checksum < tree_rmap_item->oldchecksum) {
+		if (cmp < 0) {
 			put_page(tree_page);
 			new = &parent->rb_left;
-		} else if (checksum > tree_rmap_item->oldchecksum) {
+		} else if (cmp > 0) {
 			put_page(tree_page);
 			new = &parent->rb_right;
 		} else {
@@ -1229,12 +1307,12 @@ static void cmp_and_merge_page(struct page *page, struct rmap_item *rmap_item)
 	struct page *tree_page = NULL;
 	struct stable_node *stable_node;
 	struct page *kpage;
-	unsigned int checksum;
-	int err;
+	u32 checksum[KSM_CHECKSUM_SIZE];
+	int err, cmp;
 
 	remove_rmap_item_from_tree(rmap_item);
 
-	checksum = calc_checksum(page);
+	calc_checksum(page, checksum);
 	/* We first start with searching the page inside the stable tree */
 	kpage = stable_tree_search(page, checksum);
 	if (kpage) {
@@ -1258,8 +1336,9 @@ static void cmp_and_merge_page(struct page *page, struct rmap_item *rmap_item)
 	 * don't want to insert it in the unstable tree, and we don't want
 	 * to waste our time searching for something identical to it there.
 	 */
-	if (rmap_item->oldchecksum != checksum) {
-		rmap_item->oldchecksum = checksum;
+	cmp = checksum_compare(rmap_item->oldchecksum, checksum);
+	if (cmp) {
+		checksum_copy2(checksum, rmap_item->oldchecksum);
 		return;
 	}
 
@@ -1619,7 +1698,7 @@ int ksm_madvise(struct vm_area_struct *vma, unsigned long start,
 int __ksm_enter(struct mm_struct *mm)
 {
 	struct mm_slot *mm_slot;
-	int needs_wakeup;
+//	int needs_wakeup;
 
 	mm_slot = alloc_mm_slot();
 	if (!mm_slot)
@@ -2144,6 +2223,15 @@ static int __init ksm_init(void)
 	struct task_struct *ksm_thread;
 	int err;
 
+#ifdef CONFIG_KSM_SHA1
+	ksm_hash_tfm = crypto_alloc_hash("sha1", 0, CRYPTO_ALG_TYPE_SHASH);
+	if (IS_ERR(ksm_hash_tfm)) {
+		printk(KERN_ERR "Ksm failed to load transform SHA1\n");
+		err = PTR_ERR(ksm_hash_tfm);
+		goto out;
+	}
+#endif
+
 	err = ksm_slab_init();
 	if (err)
 		goto out;
@@ -2187,4 +2275,10 @@ out_free1:
 out:
 	return err;
 }
+
+#ifdef MODULE
 module_init(ksm_init)
+#else
+late_initcall(ksm_init);
+#endif
+
