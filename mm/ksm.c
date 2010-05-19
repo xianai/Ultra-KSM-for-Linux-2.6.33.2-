@@ -960,12 +960,17 @@ static int try_to_merge_one_page(struct vm_area_struct *vma,
 	 */
 	if (write_protect_page(vma, page, &orig_pte) == 0) {
 		if (!kpage) {
+			long map_sharing = atomic_read(&page->_mapcount);
 			/*
 			 * While we hold page lock, upgrade page from
 			 * PageAnon+anon_vma to PageKsm+NULL stable_node:
 			 * stable_tree_insert() will update stable_node.
 			 */
 			set_page_stable_node(page, NULL);
+			if (map_sharing)
+				add_zone_page_state(page_zone(page),
+						    NR_KSM_PAGES_SHARING,
+						    map_sharing);
 			mark_page_accessed(page);
 			err = 0;
 		} else if (pages_identical(page, kpage))
@@ -1151,16 +1156,16 @@ static struct stable_node *stable_tree_insert(struct page *kpage)
 		struct page *tree_page;
 		int cmp, ret;
 
-		cond_resched();
+		//cond_resched();
 		stable_node = rb_entry(*new, struct stable_node, node);
-
+/*
 		tree_page = get_ksm_page(stable_node);
 		if (!tree_page)
 			return NULL;
 
-		//ret = memcmp_pages(kpage, tree_page);
-		//put_page(tree_page);
-
+		ret = memcmp_pages(kpage, tree_page);
+		put_page(tree_page);
+*/
 		cmp = checksum_compare(checksum, stable_node->checksum);
 
 		parent = *new;
@@ -1175,19 +1180,18 @@ static struct stable_node *stable_tree_insert(struct page *kpage)
  			   not yet write-protected, so may have changed since.
  			   In addition, we must check if it's a hash collision.
 			 */
-			//tree_page = get_ksm_page(stable_node);
-			//if (!tree_page)
-			//	return NULL;
+			tree_page = get_ksm_page(stable_node);
+			if (!tree_page)
+				return NULL;
 
 			ret = memcmp_pages(kpage, tree_page);
-			//put_page(tree_page);
+			put_page(tree_page);
 
 			if (!ret)
 				return NULL;
 			else
 				BUG(); /* TODO: deal with hash collision*/
 		}
-		put_page(tree_page);
 	}
 
 	stable_node = alloc_stable_node();

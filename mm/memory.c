@@ -633,6 +633,8 @@ copy_one_pte(struct mm_struct *dst_mm, struct mm_struct *src_mm,
 		get_page(page);
 		page_dup_rmap(page);
 		rss[PageAnon(page)]++;
+		if (PageKsm(page))
+			inc_zone_page_state(page, NR_KSM_PAGES_SHARING);
 	}
 
 out_set_pte:
@@ -1256,7 +1258,7 @@ int __get_user_pages(struct task_struct *tsk, struct mm_struct *mm,
 
 	VM_BUG_ON(!!pages != !!(gup_flags & FOLL_GET));
 
-	/* 
+	/*
 	 * Require read or write permissions.
 	 * If FOLL_FORCE is set, we only require the "MAY" flags.
 	 */
