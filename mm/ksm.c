@@ -42,6 +42,8 @@
 
 //#define CONFIG_KSM_SHA1 1
 
+#define CONFIG_KSM_SUPERFASTHASH 1
+
 #ifdef CONFIG_KSM_SHA1
 #define KSM_CHECKSUM_SIZE	5
 #else
