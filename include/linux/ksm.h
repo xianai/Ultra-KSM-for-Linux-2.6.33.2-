@@ -17,17 +17,23 @@ struct stable_node;
 struct mem_cgroup;
 
 #ifdef CONFIG_KSM
-int ksm_madvise(struct vm_area_struct *vma, unsigned long start,
-		unsigned long end, int advice, unsigned long *vm_flags);
+/**
+ * struct mm_slot - ksm information per mm that is being scanned
+ * @link: link to the mm_slots hash list
+ * @mm_list: link into the mm_slots list, rooted in ksm_mm_head
+ * @rmap_list: head for this mm_slot's singly-linked list of rmap_items
+ * @mm: the mm that this information is valid for
+ */
+struct mm_slot {
+	struct hlist_node link;
+	struct list_head mm_list;
+	struct rmap_item *rmap_list;
+	struct mm_struct *mm;
+};
+
 int __ksm_enter(struct mm_struct *mm);
 void __ksm_exit(struct mm_struct *mm);
-
-static inline int ksm_fork(struct mm_struct *mm, struct mm_struct *oldmm)
-{
-	if (test_bit(MMF_VM_MERGEABLE, &oldmm->flags))
-		return __ksm_enter(mm);
-	return 0;
-}
+int ksm_fork(struct mm_struct *mm, struct mm_struct *oldmm);
 
 static inline void ksm_exit(struct mm_struct *mm)
 {
@@ -58,6 +64,18 @@ static inline void set_page_stable_node(struct page *page,
 	page->mapping = (void *)stable_node +
 				(PAGE_MAPPING_ANON | PAGE_MAPPING_KSM);
 }
+
+static inline void ksm_init_vma(struct vm_area_struct *vma)
+{
+	vma->dedup_ratio = 0;
+	vma->ksm_index = -1;
+	INIT_LIST_HEAD(&vma->ksm_list);
+	vma->pages_scanned = 0;
+	vma->pages_to_scan = 0;
+	vma->rung = 0;
+}
+
+void ksm_remove_vma(struct vm_area_struct *vma);
 
 /*
  * When do_swap_page() first faults in from swap what used to be a KSM page,
@@ -92,6 +110,15 @@ int rmap_walk_ksm(struct page *page, int (*rmap_one)(struct page *,
 		  struct vm_area_struct *, unsigned long, void *), void *arg);
 void ksm_migrate_page(struct page *newpage, struct page *oldpage);
 
+struct scan_rung {
+	struct list_head vma_list;
+	spinlock_t vma_list_lock;
+	struct list_head *current_scan;
+	unsigned int pages_to_scan;
+	unsigned char round_finished;
+	unsigned long scan_ratio;
+};
+
 #else  /* !CONFIG_KSM */
 
 static inline int ksm_fork(struct mm_struct *mm, struct mm_struct *oldmm)
@@ -109,11 +136,6 @@ static inline int PageKsm(struct page *page)
 }
 
 #ifdef CONFIG_MMU
-static inline int ksm_madvise(struct vm_area_struct *vma, unsigned long start,
-		unsigned long end, int advice, unsigned long *vm_flags)
-{
-	return 0;
-}
 
 static inline struct page *ksm_might_need_to_copy(struct page *page,
 			struct vm_area_struct *vma, unsigned long address)
