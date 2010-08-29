@@ -73,6 +73,7 @@ static inline void ksm_init_vma(struct vm_area_struct *vma)
 	vma->pages_scanned = 0;
 	vma->pages_to_scan = 0;
 	vma->rung = 0;
+	vma->rmap_list = NULL;
 }
 
 void ksm_remove_vma(struct vm_area_struct *vma);
@@ -119,6 +120,8 @@ struct scan_rung {
 	unsigned long scan_ratio;
 };
 
+DEFINE_RWLOCK(ksm_stable_tree_lock);
+DEFINE_RWLOCK(ksm_unstable_tree_lock);
 #else  /* !CONFIG_KSM */
 
 static inline int ksm_fork(struct mm_struct *mm, struct mm_struct *oldmm)

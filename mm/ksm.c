@@ -139,7 +139,7 @@ struct rmap_item {
 	struct anon_vma *anon_vma;	/* when stable */
 	struct mm_struct *mm;
 	unsigned long address;		/* + low bits used for flags below */
-	/* which round is it, when this item is appended to stable */
+	/* which round is it, when this item is appended to tree */
 	unsigned long scan_round;
 	u32 oldchecksum[KSM_CHECKSUM_SIZE];	/* when unstable */
 	union {
@@ -158,6 +158,7 @@ struct rmap_item {
 /* The stable and unstable tree heads */
 static struct rb_root root_stable_tree = RB_ROOT;
 static struct rb_root root_unstable_tree = RB_ROOT;
+
 
 #define MM_SLOTS_HASH_HEADS 1024
 static struct hlist_head *mm_slots_hash;
@@ -210,7 +211,7 @@ static unsigned int ksm_scan_ratio_delta = 2;
 /* Each rung of this ladder is a list of VMAs having a same scan ratio */
 static struct scan_rung *ksm_scan_ladder;
 static unsigned int ksm_scan_ladder_size;
-static DEFINE_SPINLOCK(ksm_scan_ladder_lock);
+
 
 #define KSM_RUN_STOP	0
 #define KSM_RUN_MERGE	1
@@ -334,6 +335,8 @@ int ksm_fork(struct mm_struct *mm, struct mm_struct *oldmm)
 
 void ksm_remove_vma(struct vm_area_struct *vma)
 {
+	struct rmap_item *rmap, *rmap_old;
+
 	if (list_empty(&vma->ksm_list) || !vma->rung)
 	    return;
 
@@ -342,6 +345,16 @@ void ksm_remove_vma(struct vm_area_struct *vma)
 		vma->rung->current_scan = vma->rung->current_scan->next;
 	list_del_init(&vma->ksm_list);
  	spin_unlock(&vma->rung->vma_list_lock);
+
+	rmap = vma->rmap_list;
+	rmap_old = NULL;
+
+	while (rmap) {
+		rmap_old = rmap;
+		rmap = rmap->rmap_list;
+		remove_rmap_item_from_tree(rmap_old);
+		free_rmap_item(rmap_old);
+	}
 }
 
 static inline void free_mm_slot(struct mm_slot *mm_slot)
@@ -623,6 +636,7 @@ static void remove_rmap_item_from_tree(struct rmap_item *rmap_item)
 		struct stable_node *stable_node;
 		struct page *page;
 
+		write_lock(&ksm_stable_tree_lock);
 		stable_node = rmap_item->head;
 		page = get_ksm_page(stable_node);
 		if (!page)
@@ -638,11 +652,14 @@ static void remove_rmap_item_from_tree(struct rmap_item *rmap_item)
 		else
 			ksm_pages_shared--;
 
+		write_unlock(&ksm_stable_tree_lock);
 		drop_anon_vma(rmap_item);
 		rmap_item->address &= PAGE_MASK;
 
 	} else if (rmap_item->address & UNSTABLE_FLAG) {
 		unsigned char age;
+
+		write_lock(&ksm_unstable_tree_lock);
 		/*
 		 * Usually ksmd can and must skip the rb_erase, because
 		 * root_unstable_tree was already reset to RB_ROOT.
@@ -650,11 +667,12 @@ static void remove_rmap_item_from_tree(struct rmap_item *rmap_item)
 		 * if this rmap_item was inserted by this scan, rather
 		 * than left over from before.
 		 */
-		age = (unsigned char)(ksm_scan.seqnr - rmap_item->address);
-		BUG_ON(age > 1);
-		if (!age)
+//		age = (unsigned char)(ksm_scan.seqnr - rmap_item->address);
+//		BUG_ON(age > 1);
+//		if (!age)
+		if (rmap_item->scan_round == ksm_scan_round)
 			rb_erase(&rmap_item->node, &root_unstable_tree);
-
+		write_unlock(&ksm_unstable_tree_lock);
 		ksm_pages_unshared--;
 		rmap_item->address &= PAGE_MASK;
 	}
@@ -1349,7 +1367,8 @@ struct rmap_item *unstable_tree_search_insert(struct rmap_item *rmap_item,
 	}
 
 	rmap_item->address |= UNSTABLE_FLAG;
-	rmap_item->address |= (ksm_scan.seqnr & SEQNR_MASK);
+	//rmap_item->address |= (ksm_scan.seqnr & SEQNR_MASK);
+	rmap_item->scan_round = ksm_scan_round;
 	checksum_copy2(checksum, rmap_item->oldchecksum);
 	rb_link_node(&rmap_item->node, parent, new);
 	rb_insert_color(&rmap_item->node, &root_unstable_tree);
@@ -1469,7 +1488,9 @@ static void cmp_and_merge_page(struct page *page, struct rmap_item *rmap_item)
 
 	calc_checksum(page, checksum);
 	/* We first start with searching the page inside the stable tree */
+	read_lock(&ksm_stable_tree_lock);
 	kpage = stable_tree_search(page, checksum);
+	read_unlock(&ksm_stable_tree_lock);
 	if (kpage) {
 		err = try_to_merge_with_ksm_page(rmap_item, page,
 						 kpage, &same_page);
@@ -1478,9 +1499,11 @@ static void cmp_and_merge_page(struct page *page, struct rmap_item *rmap_item)
 			 * The page was successfully merged:
 			 * add its rmap_item to the stable tree.
 			 */
+			write_lock(&ksm_stable_tree_lock); /* before lock_page */
 			lock_page(kpage);
 			stable_tree_append(rmap_item, page_stable_node(kpage));
 			unlock_page(kpage);
+			write_unlock(&ksm_stable_tree_lock);
 			if (!same_page)
 				update_intertab_stable(rmap_item, kpage);
 		}
@@ -1541,12 +1564,12 @@ static void cmp_and_merge_page(struct page *page, struct rmap_item *rmap_item)
 	}
 }
 
-static struct rmap_item *get_next_rmap_item(struct mm_slot *slot,
+static struct rmap_item *get_next_rmap_item(struct vm_area_struct *vma,
 					    unsigned long addr)
 {
 	struct rmap_item *rmap_item, *rmap_item_old , *rmap_item_new;
 
-	rmap_item = slot->rmap_list;
+	rmap_item = vma->rmap_list;
 	rmap_item_old = NULL;
 
 	while (rmap_item) {
@@ -1570,7 +1593,7 @@ static struct rmap_item *get_next_rmap_item(struct mm_slot *slot,
 		if (rmap_item_old)
 			rmap_item_old->rmap_list = rmap_item;
 		else
-			slot->rmap_list = rmap_item_new;
+			vma->rmap_list = rmap_item_new;
 		rmap_item = rmap_item_new;
 	}
 	return rmap_item;
@@ -1586,7 +1609,7 @@ static void scan_vma_one_page(struct vm_area_struct *vma)
 	struct mm_struct *mm;
 	unsigned long pages, addr;
 	struct page *page;
-	struct mm_slot *slot;
+	//struct mm_slot *slot;
 	struct rmap_item *rmap_item;
 
 
@@ -1604,8 +1627,8 @@ static void scan_vma_one_page(struct vm_area_struct *vma)
 	pages = (vma->vm_end - vma->vm_start) / PAGE_SIZE;
 	addr = vma->vm_start + (random32() % pages) * PAGE_SIZE;
 
-	slot = get_mm_slot(mm);
-	BUG_ON(!slot);
+	//slot = get_mm_slot(mm);
+	//BUG_ON(!slot);
 
 	page = follow_page(vma, addr, FOLL_GET);
 
@@ -1618,7 +1641,7 @@ static void scan_vma_one_page(struct vm_area_struct *vma)
 
 	flush_anon_page(vma, page, addr);
 	flush_dcache_page(page);
-	rmap_item = get_next_rmap_item(slot, addr);
+	rmap_item = get_next_rmap_item(vma, addr);
 	if (!rmap_item) {
 		goto out2;
 	}
@@ -1882,7 +1905,11 @@ static void ksm_do_scan(void)
 	if (round_finished) {
 		round_update_ladder();
 
+		/* sync with ksm_remove_vma for rb_erase */
+		read_lock(&ksm_unstable_tree_lock);
 		ksm_scan_round++;
+		root_unstable_tree = RB_ROOT;
+		read_unlock(&ksm_unstable_tree_lock);
 	}
 	cal_ladder_pages_to_scan(ksm_pages_to_scan(ksm_batch_millionth_ratio));
 }

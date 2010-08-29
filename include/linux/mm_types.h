@@ -196,6 +196,7 @@ struct vm_area_struct {
         unsigned long pages_scanned;
         unsigned long pages_to_scan;
         struct scan_rung *rung;
+	struct rmap_item *rmap_list;
 #endif
 };
 
