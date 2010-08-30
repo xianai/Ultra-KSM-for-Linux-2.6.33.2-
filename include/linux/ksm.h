@@ -114,14 +114,14 @@ void ksm_migrate_page(struct page *newpage, struct page *oldpage);
 struct scan_rung {
 	struct list_head vma_list;
 	spinlock_t vma_list_lock;
+	struct semaphore sem;
 	struct list_head *current_scan;
 	unsigned int pages_to_scan;
 	unsigned char round_finished;
 	unsigned long scan_ratio;
 };
 
-DEFINE_RWLOCK(ksm_stable_tree_lock);
-DEFINE_RWLOCK(ksm_unstable_tree_lock);
+//extern struct semaphore ksm_scan_sem;
 #else  /* !CONFIG_KSM */
 
 static inline int ksm_fork(struct mm_struct *mm, struct mm_struct *oldmm)
