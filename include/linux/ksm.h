@@ -74,6 +74,8 @@ static inline void ksm_init_vma(struct vm_area_struct *vma)
 	vma->pages_to_scan = 0;
 	vma->rung = 0;
 	vma->rmap_list = NULL;
+	vma->rmap_num = 0;
+	vma->vm_flags &= ~VM_MERGEABLE;
 }
 
 void ksm_remove_vma(struct vm_area_struct *vma);
@@ -119,6 +121,8 @@ struct scan_rung {
 	unsigned int pages_to_scan;
 	unsigned char round_finished;
 	unsigned long scan_ratio;
+	unsigned long vma_num;
+	unsigned long vma_finished;
 };
 
 //extern struct semaphore ksm_scan_sem;

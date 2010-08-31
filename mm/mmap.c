@@ -2292,6 +2292,9 @@ struct vm_area_struct *copy_vma(struct vm_area_struct **vmap,
 			}
 			if (new_vma->vm_ops && new_vma->vm_ops->open)
 				new_vma->vm_ops->open(new_vma);
+#ifdef CONFIG_KSM
+			ksm_init_vma(new_vma);
+#endif
 			vma_link(mm, new_vma, prev, rb_link, rb_parent);
 		}
 	}

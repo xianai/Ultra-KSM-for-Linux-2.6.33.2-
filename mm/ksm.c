@@ -186,6 +186,9 @@ static unsigned long ksm_pages_unshared;
 /* The number of rmap_items in use: to calculate pages_volatile */
 static unsigned long ksm_rmap_items;
 
+
+static unsigned long ksm_stable_nodes;
+
 /* Number of pages ksmd should scan in one batch, in ratio of millionth */
 static unsigned int ksm_batch_millionth_ratio = 10000;
 
@@ -203,6 +206,7 @@ static unsigned int *ksm_inter_vma_table;
 static struct vm_area_struct **ksm_vma_table;
 static unsigned int ksm_vma_table_size = 10240;
 static unsigned long ksm_vma_table_num = 0;
+static unsigned long ksm_vma_table_index_max = 0;
 
 static unsigned long ksm_scan_round = 1;
 
@@ -303,11 +307,13 @@ static inline void free_rmap_item(struct rmap_item *rmap_item)
 
 static inline struct stable_node *alloc_stable_node(void)
 {
+	ksm_stable_nodes++;
 	return kmem_cache_alloc(stable_node_cache, GFP_KERNEL | GFP_ATOMIC);
 }
 
 static inline void free_stable_node(struct stable_node *stable_node)
 {
+	ksm_stable_nodes--;
 	kmem_cache_free(stable_node_cache, stable_node);
 }
 
@@ -691,6 +697,7 @@ void ksm_remove_vma(struct vm_area_struct *vma)
 		vma->rung->current_scan = vma->rung->current_scan->next;
 
 	list_del_init(&vma->ksm_list);
+	vma->rung->vma_num--;
 
 	if (vma->rung->current_scan == &vma->rung->vma_list) {
 		/* This rung finishes a round */
@@ -704,6 +711,8 @@ void ksm_remove_vma(struct vm_area_struct *vma)
 			ksm_intertab_clear(vma);
 			ksm_vma_table_num--;
 			ksm_vma_table[i] = NULL;
+			if (i == ksm_vma_table_index_max)
+				ksm_vma_table_index_max--;
 			break;
 		}
 	}
@@ -716,6 +725,10 @@ void ksm_remove_vma(struct vm_area_struct *vma)
 		rmap = rmap->rmap_list;
 		remove_rmap_item_from_tree(rmap_old);
 		free_rmap_item(rmap_old);
+		vma->rmap_num--;
+	}
+	if (vma->rmap_num) {
+		printk(KERN_ERR "BUG: vma rmap not cleared fully rmap_num=%lu\n", vma->rmap_num);
 	}
 	mutex_unlock(&ksm_scan_sem);
 }
@@ -1447,6 +1460,8 @@ static void enter_inter_vma_table(struct vm_area_struct *vma)
 	vma->ksm_index = i;
 	ksm_vma_table[i] = vma;
 	ksm_vma_table_num++;
+	if (i > ksm_vma_table_index_max)
+		ksm_vma_table_index_max = i;
 }
 
 static void adjust_intertab_pair(struct vm_area_struct *vma1,
@@ -1623,10 +1638,11 @@ static struct rmap_item *get_next_rmap_item(struct vm_area_struct *vma,
 		rmap_item_new->rmap_list = rmap_item;
 
 		if (rmap_item_old)
-			rmap_item_old->rmap_list = rmap_item;
+			rmap_item_old->rmap_list = rmap_item_new;
 		else
 			vma->rmap_list = rmap_item_new;
 		rmap_item = rmap_item_new;
+		vma->rmap_num++;
 	}
 	return rmap_item;
 }
@@ -1690,28 +1706,35 @@ out1:
 	return;
 }
 
+
 static inline unsigned long get_random_sample_num(unsigned long total,
 						  unsigned long needed)
 {
-	unsigned long ret, test_needed, range_bottom, range_top;
+	unsigned long ret, test_needed, range_bottom, range_top, abs;
 
 	/* It can be proved that ret/needed <= 30/13 */
-	range_top = needed * 30 / 13;
+	range_top = needed * 3;
 	range_bottom = needed;
 
-	BUG_ON(total == 0);
 
 	do {
 		ret = (range_top + range_bottom) / 2;
 		test_needed = ret - ret * ret * 9 / (10 * total) +
 			+ ret * ret * ret / (3 * total * total);
 
-		if (test_needed > needed)
+		if (test_needed > needed) {
 			range_top = ret;
-		else
-			range_bottom = ret;
+			abs = test_needed - needed;
+		}
+		else {
+			if (range_bottom == ret)
+				range_bottom = ret + 1;
+			else
+				range_bottom = ret;
+			abs = needed - test_needed;
+		}
 
-	} while (test_needed != needed);
+	} while (abs > 3);
 
 	return ret;
 }
@@ -1719,26 +1742,26 @@ static inline unsigned long get_random_sample_num(unsigned long total,
 static unsigned long get_vma_random_scan_num(struct vm_area_struct *vma,
 					     unsigned long scan_ratio)
 {
-	unsigned long len, needed;
+	unsigned long needed;
 
-	len = vma->vm_end - vma->vm_start;
-	len /= PAGE_SIZE;
-	needed = len * scan_ratio / KSM_SCAN_RATIO_MAX;
+	needed = vma_pages(vma) * scan_ratio / KSM_SCAN_RATIO_MAX;
 
 	if (!needed)
-		needed = 1;
+		return 0;
 
-	return get_random_sample_num(len, needed);
+	return get_random_sample_num(vma_pages(vma), needed);
 }
 
 static inline void vma_rung_enter(struct vm_area_struct *vma,
 				  struct scan_rung *rung)
 {
+	unsigned long pages_to_scan;
 	/* leave the old rung it was in */
 	if (!list_empty(&vma->ksm_list)) {
 		if (vma->rung->current_scan == &vma->ksm_list)
 			vma->rung->current_scan = vma->ksm_list.next;
 		list_del_init(&vma->ksm_list);
+		vma->rung->vma_num--;
 
 		if (vma->rung->current_scan == &rung->vma_list) {
 			/* This rung finishes a round */
@@ -1748,11 +1771,17 @@ static inline void vma_rung_enter(struct vm_area_struct *vma,
 	}
 
 	/* enter the new rung */
+	while (!(pages_to_scan =
+		get_vma_random_scan_num(vma, rung->scan_ratio))) {
+		rung++;
+		BUG_ON(rung > &ksm_scan_ladder[ksm_scan_ladder_size -1]);
+	}
 	if (list_empty(&rung->vma_list))
 		rung->current_scan = &vma->ksm_list;
 	list_add_tail(&vma->ksm_list, &rung->vma_list);
 	vma->rung = rung;
-	vma->pages_to_scan = get_vma_random_scan_num(vma, rung->scan_ratio);
+	vma->pages_to_scan = pages_to_scan;
+	vma->rung->vma_num++;
 }
 
 static inline void vma_rung_up(struct vm_area_struct *vma)
@@ -1778,31 +1807,28 @@ static unsigned long cal_dedup_ratio_clear(struct vm_area_struct *vma)
 	unsigned long dedup_num = 0;
 	unsigned index;
 
-	for (i = 0; i < vma->ksm_index; i++) {
-		index = intertab_vma_offset(vma->ksm_index, i);
-		dedup_num += ksm_inter_vma_table[index]
-		* KSM_SCAN_RATIO_MAX / ksm_scan_ladder[vma->ksm_index].scan_ratio
-		* KSM_SCAN_RATIO_MAX / ksm_scan_ladder[i].scan_ratio;
-		ksm_inter_vma_table[index] = 0; /* Cleared data for this round */
-	}
+	if (!vma->pages_scanned)
+		return 0;
 
-	for (i = vma->ksm_index + 1; i < ksm_vma_table_num; i++) {
+	for (i = 0; i <= ksm_vma_table_index_max; i++) {
+		struct vm_area_struct *vma2 = ksm_vma_table[i];
+		if (!vma2 || i == vma->ksm_index || !vma2->pages_scanned)
+			continue;
+
 		index = intertab_vma_offset(vma->ksm_index, i);
 		dedup_num += ksm_inter_vma_table[index]
-		* KSM_SCAN_RATIO_MAX / ksm_scan_ladder[vma->ksm_index].scan_ratio
-		* KSM_SCAN_RATIO_MAX / ksm_scan_ladder[i].scan_ratio;
-		ksm_inter_vma_table[index] = 0;
+		* vma_pages(vma) / vma->pages_scanned
+		* vma_pages(vma2) / vma2->pages_scanned;
+
+		ksm_inter_vma_table[index] = 0; /* Cleared data for this round */
 	}
 
 	index = intertab_vma_offset(vma->ksm_index, vma->ksm_index);
 	dedup_num += ksm_inter_vma_table[index]
-		     * KSM_SCAN_RATIO_MAX / ksm_scan_ladder[i].scan_ratio;
+		     * vma_pages(vma) / vma->pages_scanned;
 	ksm_inter_vma_table[index] = 0;
 
-	return (dedup_num /
-		((vma->vm_end - vma->vm_start) / PAGE_SIZE *
-		 ksm_scan_ladder[vma->ksm_index].scan_ratio /
-		 KSM_SCAN_RATIO_MAX) * KSM_SCAN_RATIO_MAX);
+	return (dedup_num * KSM_SCAN_RATIO_MAX / vma_pages(vma));
 }
 
 static void round_update_ladder(void)
@@ -1812,7 +1838,7 @@ static void round_update_ladder(void)
 	unsigned long dedup_ratio_max = 0, dedup_ratio_mean = 0;
 	unsigned long num = 0, threshold;
 
-	for (i = 0; i < ksm_vma_table_size; i++) {
+	for (i = 0; i <= ksm_vma_table_index_max; i++) {
 		if ((vma = ksm_vma_table[i])) {
 			num++;
 			vma->dedup_ratio = cal_dedup_ratio_clear(vma);
@@ -1830,7 +1856,7 @@ static void round_update_ladder(void)
 	dedup_ratio_mean /= num;
 	threshold = (dedup_ratio_max + dedup_ratio_mean) / 2;
 
-	for (i = 0; i < ksm_vma_table_size; i++) {
+	for (i = 0; i <= ksm_vma_table_index_max; i++) {
 		if ((vma = ksm_vma_table[i])) {
 			if (vma->dedup_ratio  &&
 			    vma->dedup_ratio >= threshold) {
@@ -1842,8 +1868,14 @@ static void round_update_ladder(void)
 	}
 
 out:
-	for (i = 0; i < ksm_scan_ladder_size; i++)
+	for (i = 0; i < ksm_scan_ladder_size; i++) {
 		ksm_scan_ladder[i].round_finished = 0;
+		list_for_each_entry(vma, &ksm_scan_ladder[i].vma_list,
+				    ksm_list) {
+			vma->pages_scanned = 0;
+		}
+		ksm_scan_ladder[i].vma_finished = 0;
+	}
 
 }
 
@@ -1903,7 +1935,8 @@ static void ksm_do_scan(void)
 			BUG_ON(list_empty(&vma->ksm_list));
 
 			if (vma->pages_scanned == vma->pages_to_scan) {
-				vma->pages_scanned = 0;
+				rung->vma_finished++;
+				//vma->pages_scanned = 0;
 				next_scan = rung->current_scan->next;
 				if (next_scan == &rung->vma_list) {
 					/* This rung finishes a round */
@@ -2028,14 +2061,45 @@ static int ksm_scan_thread(void *nothing)
 
 static void ksm_vma_enter(struct vm_area_struct *vma)
 {
-	//spin_lock(&ksm_scan_ladder_lock);
+	struct scan_rung *rung;
+	unsigned long pages_to_scan;
 
+	//spin_lock(&ksm_scan_ladder_lock);
+	mutex_lock(&ksm_scan_sem);
+	if (vma->vm_flags & VM_MERGEABLE) {
+		mutex_unlock(&ksm_scan_sem);
+		return;
+	}
+
+	vma->vm_flags |= VM_MERGEABLE;
+	if (!list_empty(&vma->ksm_list)) {
+		printk(KERN_ERR "BUG:KSM vma->ksm_list should be emtpy process:%s\n", vma->vm_mm->owner->comm);
+	}
+
+/*
 	if (list_empty(&ksm_scan_ladder[0].vma_list))
 		ksm_scan_ladder[0].current_scan = &vma->ksm_list;
 
 	list_add_tail(&vma->ksm_list, &ksm_scan_ladder[0].vma_list);
 	vma->rung = &ksm_scan_ladder[0];
 	vma->pages_to_scan = get_vma_random_scan_num(vma, vma->rung->scan_ratio);
+*/
+
+	/* enter the new rung */
+	rung = &ksm_scan_ladder[0];
+	while (!(pages_to_scan =
+		get_vma_random_scan_num(vma, rung->scan_ratio))) {
+		rung++;
+		BUG_ON(rung > &ksm_scan_ladder[ksm_scan_ladder_size -1]);
+	}
+	if (list_empty(&rung->vma_list))
+		rung->current_scan = &vma->ksm_list;
+	list_add_tail(&vma->ksm_list, &rung->vma_list);
+	vma->rung = rung;
+	vma->pages_to_scan = pages_to_scan;
+	vma->rung->vma_num++;
+
+	mutex_unlock(&ksm_scan_sem);
 	//spin_unlock(&ksm_scan_ladder_lock);
 }
 
@@ -2055,6 +2119,7 @@ int __ksm_enter(struct mm_struct *mm)
 	if (strcmp(mm->owner->comm, "best_case"))
 		return 0;
 
+	printk(KERN_ERR "__ksm_enter: scan process %s\n", mm->owner->comm);
 
 
 	spin_lock(&ksm_mmlist_lock);
@@ -2075,6 +2140,9 @@ int __ksm_enter(struct mm_struct *mm)
 	for (vma = mm->mmap; vma; vma = vma->vm_next) {
 		//struct scan_rung *rung;
 
+		if (vma_pages(vma) < 15000 )
+			continue;
+
 		if (vma->vm_flags & VM_MERGEABLE)
 			continue;
 
@@ -2083,8 +2151,6 @@ int __ksm_enter(struct mm_struct *mm)
 				     VM_NONLINEAR | VM_MIXEDMAP | VM_SAO))
 			continue;
 
-		vma->vm_flags |= VM_MERGEABLE;
-		BUG_ON(!list_empty(&vma->ksm_list));
 
 		ksm_vma_enter(vma);
 	}
@@ -2549,7 +2615,7 @@ KSM_ATTR_RO(pages_volatile);
 static ssize_t full_scans_show(struct kobject *kobj,
 			       struct kobj_attribute *attr, char *buf)
 {
-	return sprintf(buf, "%lu\n", ksm_scan.seqnr);
+	return sprintf(buf, "%lu\n", ksm_scan_round);
 }
 KSM_ATTR_RO(full_scans);
 
@@ -2631,6 +2697,8 @@ static void inline init_scan_ladder(void)
 			* ksm_scan_ladder[i].scan_ratio / KSM_SCAN_RATIO_MAX;
 		INIT_LIST_HEAD(&ksm_scan_ladder[i].vma_list);
 		init_MUTEX(&ksm_scan_ladder[i].sem);
+		ksm_scan_ladder[i].vma_num = 0;
+		ksm_scan_ladder[i].vma_finished = 0;
 	}
 }
 
