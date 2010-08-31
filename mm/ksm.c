@@ -206,7 +206,7 @@ static unsigned int *ksm_inter_vma_table;
 static struct vm_area_struct **ksm_vma_table;
 static unsigned int ksm_vma_table_size = 10240;
 static unsigned long ksm_vma_table_num = 0;
-static unsigned long ksm_vma_table_index_max = 0;
+static unsigned long ksm_vma_table_index_end = 0;
 
 static unsigned long ksm_scan_round = 1;
 
@@ -688,6 +688,7 @@ void ksm_remove_vma(struct vm_area_struct *vma)
 {
 	struct rmap_item *rmap, *rmap_old;
 	int i;
+	int removed = 0;
 
 	if (list_empty(&vma->ksm_list) || !vma->rung)
 	    return;
@@ -705,17 +706,20 @@ void ksm_remove_vma(struct vm_area_struct *vma)
 		vma->rung->current_scan = vma->rung->vma_list.next;
 	}
 
-	for (i = 0; i < ksm_vma_table_size; i++) {
+	for (i = 0; i < ksm_vma_table_index_end; i++) {
 		if ((vma == ksm_vma_table[i])) {
 			//cal_dedup_ratio_clear(vma);
 			ksm_intertab_clear(vma);
 			ksm_vma_table_num--;
 			ksm_vma_table[i] = NULL;
-			if (i == ksm_vma_table_index_max)
-				ksm_vma_table_index_max--;
+			if (i == ksm_vma_table_index_end - 1)
+				ksm_vma_table_index_end--;
+			removed = 1;
 			break;
 		}
 	}
+
+	BUG_ON(!removed);
 
 	rmap = vma->rmap_list;
 	rmap_old = NULL;
@@ -1453,15 +1457,20 @@ static void enter_inter_vma_table(struct vm_area_struct *vma)
 {
 	unsigned int i;
 
-	for (i = 0; i < ksm_vma_table_size; i++) {
+	for (i = 0; i <= ksm_vma_table_index_end; i++) {
 		if (!ksm_vma_table[i])
 			break;
 	}
+	BUG_ON(ksm_vma_table[i]);
 	vma->ksm_index = i;
 	ksm_vma_table[i] = vma;
 	ksm_vma_table_num++;
-	if (i > ksm_vma_table_index_max)
-		ksm_vma_table_index_max = i;
+
+	BUG_ON(i > ksm_vma_table_index_end);
+	if (i == ksm_vma_table_index_end)
+		ksm_vma_table_index_end++;
+
+	BUG_ON(ksm_vma_table_index_end > ksm_vma_table_size - 1);
 }
 
 static void adjust_intertab_pair(struct vm_area_struct *vma1,
@@ -1810,7 +1819,7 @@ static unsigned long cal_dedup_ratio_clear(struct vm_area_struct *vma)
 	if (!vma->pages_scanned)
 		return 0;
 
-	for (i = 0; i <= ksm_vma_table_index_max; i++) {
+	for (i = 0; i < ksm_vma_table_index_end; i++) {
 		struct vm_area_struct *vma2 = ksm_vma_table[i];
 		if (!vma2 || i == vma->ksm_index || !vma2->pages_scanned)
 			continue;
@@ -1838,7 +1847,7 @@ static void round_update_ladder(void)
 	unsigned long dedup_ratio_max = 0, dedup_ratio_mean = 0;
 	unsigned long num = 0, threshold;
 
-	for (i = 0; i <= ksm_vma_table_index_max; i++) {
+	for (i = 0; i < ksm_vma_table_index_end; i++) {
 		if ((vma = ksm_vma_table[i])) {
 			num++;
 			vma->dedup_ratio = cal_dedup_ratio_clear(vma);
@@ -1856,7 +1865,7 @@ static void round_update_ladder(void)
 	dedup_ratio_mean /= num;
 	threshold = (dedup_ratio_max + dedup_ratio_mean) / 2;
 
-	for (i = 0; i <= ksm_vma_table_index_max; i++) {
+	for (i = 0; i < ksm_vma_table_index_end; i++) {
 		if ((vma = ksm_vma_table[i])) {
 			if (vma->dedup_ratio  &&
 			    vma->dedup_ratio >= threshold) {
