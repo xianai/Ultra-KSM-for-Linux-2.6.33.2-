@@ -37,6 +37,7 @@
 #include <linux/scatterlist.h>
 #include <crypto/hash.h>
 #include <linux/random.h>
+#include <linux/math64.h>
 
 #include <asm/tlbflush.h>
 #include "internal.h"
@@ -196,7 +197,7 @@ static unsigned int ksm_batch_millionth_ratio = 10000;
 static unsigned int ksm_thread_sleep_mips_time = 1000;
 
 /* minimum scan ratio for a vma, in unit of millionth */
-static unsigned int ksm_min_scan_ratio = 10000;
+static unsigned int ksm_min_scan_ratio = 50000;
 #define KSM_SCAN_RATIO_MAX	1000000
 
 /* Inter vma duplication number table page pointer array, initialized at startup */
@@ -688,7 +689,6 @@ void ksm_remove_vma(struct vm_area_struct *vma)
 {
 	struct rmap_item *rmap, *rmap_old;
 	int i;
-	int removed = 0;
 
 	if (list_empty(&vma->ksm_list) || !vma->rung)
 	    return;
@@ -714,12 +714,9 @@ void ksm_remove_vma(struct vm_area_struct *vma)
 			ksm_vma_table[i] = NULL;
 			if (i == ksm_vma_table_index_end - 1)
 				ksm_vma_table_index_end--;
-			removed = 1;
 			break;
 		}
 	}
-
-	BUG_ON(!removed);
 
 	rmap = vma->rmap_list;
 	rmap_old = NULL;
@@ -1715,11 +1712,17 @@ out1:
 	return;
 }
 
-
-static inline unsigned long get_random_sample_num(unsigned long total,
-						  unsigned long needed)
+static inline unsigned long long random_distinct_num(unsigned long long total,
+						   unsigned long long randomed)
 {
-	unsigned long ret, test_needed, range_bottom, range_top, abs;
+	return (randomed - div_u64(randomed * randomed * 9 , (10 * total)) +
+		div_u64(randomed * randomed * randomed , (3 * total * total)));
+}
+
+static inline unsigned long get_random_sample_num(unsigned long long total,
+						  unsigned long long needed)
+{
+	unsigned long long ret, test_needed, range_bottom, range_top, abs;
 
 	/* It can be proved that ret/needed <= 30/13 */
 	range_top = needed * 3;
@@ -1728,8 +1731,7 @@ static inline unsigned long get_random_sample_num(unsigned long total,
 
 	do {
 		ret = (range_top + range_bottom) / 2;
-		test_needed = ret - ret * ret * 9 / (10 * total) +
-			+ ret * ret * ret / (3 * total * total);
+		test_needed = random_distinct_num(total, ret);
 
 		if (test_needed > needed) {
 			range_top = ret;
@@ -1826,15 +1828,21 @@ static unsigned long cal_dedup_ratio_clear(struct vm_area_struct *vma)
 
 		index = intertab_vma_offset(vma->ksm_index, i);
 		dedup_num += ksm_inter_vma_table[index]
-		* vma_pages(vma) / vma->pages_scanned
-		* vma_pages(vma2) / vma2->pages_scanned;
+		* vma_pages(vma) /
+			(unsigned long) random_distinct_num(vma_pages(vma),
+							    vma->pages_scanned)
+		* vma_pages(vma2) /
+			(unsigned long) random_distinct_num(vma_pages(vma2),
+							    vma2->pages_scanned);
 
 		ksm_inter_vma_table[index] = 0; /* Cleared data for this round */
 	}
 
 	index = intertab_vma_offset(vma->ksm_index, vma->ksm_index);
 	dedup_num += ksm_inter_vma_table[index]
-		     * vma_pages(vma) / vma->pages_scanned;
+		* vma_pages(vma) /
+		(unsigned long) random_distinct_num(vma_pages(vma),
+						    vma->pages_scanned);
 	ksm_inter_vma_table[index] = 0;
 
 	return (dedup_num * KSM_SCAN_RATIO_MAX / vma_pages(vma));
@@ -2080,11 +2088,6 @@ static void ksm_vma_enter(struct vm_area_struct *vma)
 		return;
 	}
 
-	vma->vm_flags |= VM_MERGEABLE;
-	if (!list_empty(&vma->ksm_list)) {
-		printk(KERN_ERR "BUG:KSM vma->ksm_list should be emtpy process:%s\n", vma->vm_mm->owner->comm);
-	}
-
 /*
 	if (list_empty(&ksm_scan_ladder[0].vma_list))
 		ksm_scan_ladder[0].current_scan = &vma->ksm_list;
@@ -2095,6 +2098,7 @@ static void ksm_vma_enter(struct vm_area_struct *vma)
 */
 
 	/* enter the new rung */
+/*
 	rung = &ksm_scan_ladder[0];
 	while (!(pages_to_scan =
 		get_vma_random_scan_num(vma, rung->scan_ratio))) {
@@ -2107,6 +2111,20 @@ static void ksm_vma_enter(struct vm_area_struct *vma)
 	vma->rung = rung;
 	vma->pages_to_scan = pages_to_scan;
 	vma->rung->vma_num++;
+*/
+	rung = &ksm_scan_ladder[0];
+	if ((pages_to_scan = get_vma_random_scan_num(vma, rung->scan_ratio))) {
+		if (list_empty(&rung->vma_list))
+			rung->current_scan = &vma->ksm_list;
+		if (!list_empty(&vma->ksm_list)) {
+			printk(KERN_ERR "BUG:KSM vma->ksm_list should be emtpy process:%s\n", vma->vm_mm->owner->comm);
+		}
+		list_add_tail(&vma->ksm_list, &rung->vma_list);
+		vma->rung = rung;
+		vma->pages_to_scan = pages_to_scan;
+		vma->rung->vma_num++;
+		vma->vm_flags |= VM_MERGEABLE;
+	}
 
 	mutex_unlock(&ksm_scan_sem);
 	//spin_unlock(&ksm_scan_ladder_lock);
@@ -2125,8 +2143,10 @@ int __ksm_enter(struct mm_struct *mm)
 //	needs_wakeup = list_empty(&ksm_mm_head.mm_list);
 
 
+/*
 	if (strcmp(mm->owner->comm, "best_case"))
 		return 0;
+*/
 
 	printk(KERN_ERR "__ksm_enter: scan process %s\n", mm->owner->comm);
 
@@ -2149,8 +2169,10 @@ int __ksm_enter(struct mm_struct *mm)
 	for (vma = mm->mmap; vma; vma = vma->vm_next) {
 		//struct scan_rung *rung;
 
+/*
 		if (vma_pages(vma) < 15000 )
 			continue;
+*/
 
 		if (vma->vm_flags & VM_MERGEABLE)
 			continue;
