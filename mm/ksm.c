@@ -2011,7 +2011,6 @@ static inline unsigned int ksm_mips_time_to_jiffies(unsigned int mips_time)
 
 static void try_ksm_enter_all_process(void)
 {
-	struct mm_struct *mm;
 	struct task_struct *p;
 	int err;
 
@@ -2029,20 +2028,22 @@ static void try_ksm_enter_all_process(void)
 		    test_bit(MMF_VM_MERGEABLE, &p->mm->flags))
 			continue;
 
-		mm = get_task_mm(p);
-
-		//printk(KERN_ERR "Adding new task %s\n", mm->owner->comm);
-		if (mm) {
-			if (!down_read_trylock(&mm->mmap_sem))
+		//mm = get_task_mm(p);
+		task_lock(p);
+		if (p->mm) {
+			//printk(KERN_ERR "Adding new task %s\n", mm->owner->comm);
+			if (!down_read_trylock(&p->mm->mmap_sem)) {
+				task_unlock(p);
 				goto out;
+			}
 
 			err = __ksm_enter(p->mm);
 			if (err) {
 				printk(KERN_ERR "ksm_enter failure\n");
 			}
-			up_read(&mm->mmap_sem);
-			mmput(mm);
+			up_read(&p->mm->mmap_sem);
 		}
+		task_unlock(p);
 	}
 
 out:
