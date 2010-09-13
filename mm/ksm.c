@@ -92,24 +92,6 @@
  *    compare it against the stable tree, and then against the unstable tree.)
  */
 
-
-
-/**
- * struct ksm_scan - cursor for scanning
- * @mm_slot: the current mm_slot we are scanning
- * @address: the next address inside that to be scanned
- * @rmap_list: link to the next rmap to be scanned in the rmap_list
- * @seqnr: count of completed full scans (needed when removing unstable node)
- *
- * There is only the one ksm_scan instance of this cursor structure.
- */
-struct ksm_scan {
-	struct mm_slot *mm_slot;
-	unsigned long address;
-	struct rmap_item **rmap_list;
-	unsigned long seqnr;
-};
-
 /**
  * struct stable_node - node of the stable rbtree
  * @node: rb node of this ksm page in the stable tree
@@ -161,16 +143,6 @@ static struct rb_root root_stable_tree = RB_ROOT;
 static struct rb_root root_unstable_tree = RB_ROOT;
 
 
-#define MM_SLOTS_HASH_HEADS 1024
-static struct hlist_head *mm_slots_hash;
-
-static struct mm_slot ksm_mm_head = {
-	.mm_list = LIST_HEAD_INIT(ksm_mm_head.mm_list),
-};
-static struct ksm_scan ksm_scan = {
-	.mm_slot = &ksm_mm_head,
-};
-
 static struct kmem_cache *rmap_item_cache;
 static struct kmem_cache *stable_node_cache;
 static struct kmem_cache *mm_slot_cache;
@@ -221,14 +193,10 @@ static unsigned int ksm_scan_ladder_size;
 
 #define KSM_RUN_STOP	0
 #define KSM_RUN_MERGE	1
-#define KSM_RUN_UNMERGE	2
 static unsigned int ksm_run = KSM_RUN_STOP;
-
-static unsigned int ksm_enable_full_scan = 0;
 
 static DECLARE_WAIT_QUEUE_HEAD(ksm_thread_wait);
 static DEFINE_MUTEX(ksm_thread_mutex);
-static DEFINE_SPINLOCK(ksm_mmlist_lock);
 static DEFINE_MUTEX(ksm_scan_sem);
 
 #ifdef CONFIG_KSM_SHA1
@@ -267,13 +235,8 @@ static int __init ksm_slab_init(void)
 	if (!stable_node_cache)
 		goto out_free1;
 
-	mm_slot_cache = KSM_KMEM_CACHE(mm_slot, 0);
-	if (!mm_slot_cache)
-		goto out_free2;
-
 	return 0;
 
-out_free2:
 	kmem_cache_destroy(stable_node_cache);
 out_free1:
 	kmem_cache_destroy(rmap_item_cache);
@@ -318,13 +281,6 @@ static inline void free_stable_node(struct stable_node *stable_node)
 	kmem_cache_free(stable_node_cache, stable_node);
 }
 
-static inline struct mm_slot *alloc_mm_slot(void)
-{
-	if (!mm_slot_cache)	/* initialization failed */
-		return NULL;
-	return kmem_cache_zalloc(mm_slot_cache, GFP_KERNEL | GFP_ATOMIC);
-}
-
 /*
 int ksm_fork(struct mm_struct *mm, struct mm_struct *oldmm)
 {
@@ -341,52 +297,6 @@ int ksm_fork(struct mm_struct *mm, struct mm_struct *oldmm)
 	return 0;
 }
 */
-
-
-static inline void free_mm_slot(struct mm_slot *mm_slot)
-{
-	kmem_cache_free(mm_slot_cache, mm_slot);
-}
-
-static int __init mm_slots_hash_init(void)
-{
-	mm_slots_hash = kzalloc(MM_SLOTS_HASH_HEADS * sizeof(struct hlist_head),
-				GFP_KERNEL);
-	if (!mm_slots_hash)
-		return -ENOMEM;
-	return 0;
-}
-
-static void __init mm_slots_hash_free(void)
-{
-	kfree(mm_slots_hash);
-}
-
-static struct mm_slot *get_mm_slot(struct mm_struct *mm)
-{
-	struct mm_slot *mm_slot;
-	struct hlist_head *bucket;
-	struct hlist_node *node;
-
-	bucket = &mm_slots_hash[((unsigned long)mm / sizeof(struct mm_struct))
-				% MM_SLOTS_HASH_HEADS];
-	hlist_for_each_entry(mm_slot, node, bucket, link) {
-		if (mm == mm_slot->mm)
-			return mm_slot;
-	}
-	return NULL;
-}
-
-static void insert_to_mm_slots_hash(struct mm_struct *mm,
-				    struct mm_slot *mm_slot)
-{
-	struct hlist_head *bucket;
-
-	bucket = &mm_slots_hash[((unsigned long)mm / sizeof(struct mm_struct))
-				% MM_SLOTS_HASH_HEADS];
-	mm_slot->mm = mm;
-	hlist_add_head(&mm_slot->link, bucket);
-}
 
 static inline int in_stable_tree(struct rmap_item *rmap_item)
 {
@@ -645,7 +555,7 @@ static void remove_rmap_item_from_tree(struct rmap_item *rmap_item)
 		rmap_item->address &= PAGE_MASK;
 
 	} else if (rmap_item->address & UNSTABLE_FLAG) {
-		unsigned char age;
+		//unsigned char age;
 
 		/*
 		 * Usually ksmd can and must skip the rb_erase, because
@@ -734,17 +644,6 @@ void ksm_remove_vma(struct vm_area_struct *vma)
 	mutex_unlock(&ksm_scan_sem);
 }
 
-static void remove_trailing_rmap_items(struct mm_slot *mm_slot,
-				       struct rmap_item **rmap_list)
-{
-	while (*rmap_list) {
-		struct rmap_item *rmap_item = *rmap_list;
-		*rmap_list = rmap_item->rmap_list;
-		remove_rmap_item_from_tree(rmap_item);
-		free_rmap_item(rmap_item);
-	}
-}
-
 /*
  * Though it's very tempting to unmerge in_stable_tree(rmap_item)s rather
  * than check every pte of a given vma, the locking doesn't quite work for
@@ -758,6 +657,7 @@ static void remove_trailing_rmap_items(struct mm_slot *mm_slot,
  * to the next pass of ksmd - consider, for example, how ksmd might be
  * in cmp_and_merge_page on one of the rmap_items we would be removing.
  */
+/*
 static int unmerge_ksm_pages(struct vm_area_struct *vma,
 			     unsigned long start, unsigned long end)
 {
@@ -774,69 +674,7 @@ static int unmerge_ksm_pages(struct vm_area_struct *vma,
 	}
 	return err;
 }
-
-#ifdef CONFIG_SYSFS
-/*
- * Only called through the sysfs control interface:
- */
-static int unmerge_and_remove_all_rmap_items(void)
-{
-	struct mm_slot *mm_slot;
-	struct mm_struct *mm;
-	struct vm_area_struct *vma;
-	int err = 0;
-
-	spin_lock(&ksm_mmlist_lock);
-	ksm_scan.mm_slot = list_entry(ksm_mm_head.mm_list.next,
-						struct mm_slot, mm_list);
-	spin_unlock(&ksm_mmlist_lock);
-
-	for (mm_slot = ksm_scan.mm_slot;
-			mm_slot != &ksm_mm_head; mm_slot = ksm_scan.mm_slot) {
-		mm = mm_slot->mm;
-		down_read(&mm->mmap_sem);
-		for (vma = mm->mmap; vma; vma = vma->vm_next) {
-			if (ksm_test_exit(mm))
-				break;
-			if (!(vma->vm_flags & VM_MERGEABLE) || !vma->anon_vma)
-				continue;
-			err = unmerge_ksm_pages(vma,
-						vma->vm_start, vma->vm_end);
-			if (err)
-				goto error;
-		}
-
-		remove_trailing_rmap_items(mm_slot, &mm_slot->rmap_list);
-
-		spin_lock(&ksm_mmlist_lock);
-		ksm_scan.mm_slot = list_entry(mm_slot->mm_list.next,
-						struct mm_slot, mm_list);
-		if (ksm_test_exit(mm)) {
-			hlist_del(&mm_slot->link);
-			list_del(&mm_slot->mm_list);
-			spin_unlock(&ksm_mmlist_lock);
-
-			free_mm_slot(mm_slot);
-			clear_bit(MMF_VM_MERGEABLE, &mm->flags);
-			up_read(&mm->mmap_sem);
-			mmdrop(mm);
-		} else {
-			spin_unlock(&ksm_mmlist_lock);
-			up_read(&mm->mmap_sem);
-		}
-	}
-
-	ksm_scan.seqnr = 0;
-	return 0;
-
-error:
-	up_read(&mm->mmap_sem);
-	spin_lock(&ksm_mmlist_lock);
-	ksm_scan.mm_slot = &ksm_mm_head;
-	spin_unlock(&ksm_mmlist_lock);
-	return err;
-}
-#endif /* CONFIG_SYSFS */
+*/
 
 #if !defined (get16bits)
 	#define get16bits(d) ((((uint32_t)(((const uint8_t *)(d))[1])) << 8)\
@@ -1917,7 +1755,7 @@ static void inline cal_ladder_pages_to_scan(unsigned int num)
  */
 static void ksm_do_scan(void)
 {
-	unsigned long num, scan_bonus = 0;
+	unsigned long scan_bonus = 0;
 	struct vm_area_struct *vma;
 	struct list_head *next_scan;
 	unsigned char round_finished = 1;
@@ -1999,8 +1837,7 @@ static void ksm_do_scan(void)
 
 static int ksmd_should_run(void)
 {
-	return (ksm_run & KSM_RUN_MERGE) &&
-		(!list_empty(&ksm_mm_head.mm_list) || ksm_enable_full_scan);
+	return (ksm_run & KSM_RUN_MERGE);
 }
 
 static inline unsigned int ksm_mips_time_to_jiffies(unsigned int mips_time)
@@ -2057,13 +1894,11 @@ static int ksm_scan_thread(void *nothing)
 	set_user_nice(current, 5);
 
 	while (!kthread_should_stop()) {
-		if (ksm_enable_full_scan) {
-			try_ksm_enter_all_process();
-		}
-
 		mutex_lock(&ksm_thread_mutex);
-		if (ksmd_should_run())
+		if (ksmd_should_run()) {
+			try_ksm_enter_all_process();
 			ksm_do_scan();
+		}
 		mutex_unlock(&ksm_thread_mutex);
 
 		if (ksmd_should_run()) {
@@ -2134,11 +1969,6 @@ static void ksm_vma_enter(struct vm_area_struct *vma)
 int __ksm_enter(struct mm_struct *mm)
 {
 	struct vm_area_struct *vma;
-	struct mm_slot *mm_slot;
-//	int needs_wakeup;
-	mm_slot = alloc_mm_slot();
-	if (!mm_slot)
-		return -ENOMEM;
 
 	/* Check ksm_run too?  Would need tighter locking */
 //	needs_wakeup = list_empty(&ksm_mm_head.mm_list);
@@ -2150,17 +1980,6 @@ int __ksm_enter(struct mm_struct *mm)
 */
 
 	printk(KERN_ERR "__ksm_enter: scan process %s\n", mm->owner->comm);
-
-
-	spin_lock(&ksm_mmlist_lock);
-	insert_to_mm_slots_hash(mm, mm_slot);
-	/*
-	 * Insert just behind the scanning cursor, to let the area settle
-	 * down a little; when fork is followed by immediate exec, we don't
-	 * want ksmd to waste time setting up and tearing down an rmap_list.
-	 */
-	list_add_tail(&mm_slot->mm_list, &ksm_scan.mm_slot->mm_list);
-	spin_unlock(&ksm_mmlist_lock);
 
 	set_bit(MMF_VM_MERGEABLE, &mm->flags);
 	atomic_inc(&mm->mm_count);
@@ -2195,40 +2014,9 @@ int __ksm_enter(struct mm_struct *mm)
 
 void __ksm_exit(struct mm_struct *mm)
 {
-	struct mm_slot *mm_slot;
-	int easy_to_free = 0;
+	clear_bit(MMF_VM_MERGEABLE, &mm->flags);
+	mmdrop(mm);
 
-	/*
-	 * This process is exiting: if it's straightforward (as is the
-	 * case when ksmd was never running), free mm_slot immediately.
-	 * But if it's at the cursor or has rmap_items linked to it, use
-	 * mmap_sem to synchronize with any break_cows before pagetables
-	 * are freed, and leave the mm_slot on the list for ksmd to free.
-	 * Beware: ksm may already have noticed it exiting and freed the slot.
-	 */
-
-	spin_lock(&ksm_mmlist_lock);
-	mm_slot = get_mm_slot(mm);
-	if (mm_slot && ksm_scan.mm_slot != mm_slot) {
-		if (!mm_slot->rmap_list) {
-			hlist_del(&mm_slot->link);
-			list_del(&mm_slot->mm_list);
-			easy_to_free = 1;
-		} else {
-			list_move(&mm_slot->mm_list,
-				  &ksm_scan.mm_slot->mm_list);
-		}
-	}
-	spin_unlock(&ksm_mmlist_lock);
-
-	if (easy_to_free) {
-		free_mm_slot(mm_slot);
-		clear_bit(MMF_VM_MERGEABLE, &mm->flags);
-		mmdrop(mm);
-	} else if (mm_slot) {
-		down_write(&mm->mmap_sem);
-		up_write(&mm->mmap_sem);
-	}
 }
 
 struct page *ksm_does_need_to_copy(struct page *page,
@@ -2574,7 +2362,7 @@ static ssize_t run_store(struct kobject *kobj, struct kobj_attribute *attr,
 	err = strict_strtoul(buf, 10, &flags);
 	if (err || flags > UINT_MAX)
 		return -EINVAL;
-	if (flags > KSM_RUN_UNMERGE)
+	if (flags > KSM_RUN_MERGE)
 		return -EINVAL;
 
 	/*
@@ -2587,15 +2375,6 @@ static ssize_t run_store(struct kobject *kobj, struct kobj_attribute *attr,
 	mutex_lock(&ksm_thread_mutex);
 	if (ksm_run != flags) {
 		ksm_run = flags;
-		if (flags & KSM_RUN_UNMERGE) {
-			current->flags |= PF_OOM_ORIGIN;
-			err = unmerge_and_remove_all_rmap_items();
-			current->flags &= ~PF_OOM_ORIGIN;
-			if (err) {
-				ksm_run = KSM_RUN_STOP;
-				count = err;
-			}
-		}
 	}
 	mutex_unlock(&ksm_thread_mutex);
 
@@ -2651,49 +2430,6 @@ static ssize_t full_scans_show(struct kobject *kobj,
 }
 KSM_ATTR_RO(full_scans);
 
-
-static ssize_t enable_full_memory_scan_show(struct kobject *kobj,
-				  struct kobj_attribute *attr, char *buf)
-{
-	return sprintf(buf, "%u\n", ksm_enable_full_scan);
-}
-
-/*
- * 0 -> 1: add all tasks' mm to ksm list
- * 1 -> 0: do the same like KSM_RUN_UNMERGE
- */
-static ssize_t enable_full_memory_scan_store(struct kobject *kobj,
-				   struct kobj_attribute *attr,
-				   const char *buf, size_t count)
-{
-	int err;
-	unsigned long enable_full_scan;
-
-	err = strict_strtoul(buf, 10, &enable_full_scan);
-	if (err || enable_full_scan > UINT_MAX)
-		return -EINVAL;
-
-	if (enable_full_scan == ksm_enable_full_scan)
-		return count;
-
-	ksm_enable_full_scan = enable_full_scan;
-
-	if (!enable_full_scan) {
-		mutex_lock(&ksm_thread_mutex);
-		current->flags |= PF_OOM_ORIGIN;
-		err = unmerge_and_remove_all_rmap_items();
-		current->flags &= ~PF_OOM_ORIGIN;
-		if (err) count = err;
-
-		ksm_run = KSM_RUN_STOP;
-		mutex_unlock(&ksm_thread_mutex);
-	}
-
-	return count;
-}
-KSM_ATTR(enable_full_memory_scan);
-
-
 static struct attribute *ksm_attrs[] = {
 	&sleep_mips_time_attr.attr,
 	&batch_millionth_ratio_attr.attr,
@@ -2703,7 +2439,6 @@ static struct attribute *ksm_attrs[] = {
 	&pages_unshared_attr.attr,
 	&pages_volatile_attr.attr,
 	&full_scans_attr.attr,
-	&enable_full_memory_scan_attr.attr,
 	&min_scan_ratio_attr.attr,
 	NULL,
 };
@@ -2789,15 +2524,11 @@ static int __init ksm_init(void)
 	if (err)
 		goto out_free;
 
-	err = mm_slots_hash_init();
-	if (err)
-		goto out_free1;
-
 	ksm_thread = kthread_run(ksm_scan_thread, NULL, "ksmd");
 	if (IS_ERR(ksm_thread)) {
 		printk(KERN_ERR "ksm: creating kthread failed\n");
 		err = PTR_ERR(ksm_thread);
-		goto out_free2;
+		goto out_free1;
 	}
 
 #ifdef CONFIG_SYSFS
@@ -2805,7 +2536,7 @@ static int __init ksm_init(void)
 	if (err) {
 		printk(KERN_ERR "ksm: register sysfs failed\n");
 		kthread_stop(ksm_thread);
-		goto out_free2;
+		goto out_free1;
 	}
 #else
 	ksm_run = KSM_RUN_MERGE;	/* no way for user to start it */
@@ -2821,8 +2552,6 @@ static int __init ksm_init(void)
 #endif
 	return 0;
 
-out_free2:
-	mm_slots_hash_free();
 out_free1:
 	ksm_slab_free();
 out_free:

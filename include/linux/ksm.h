@@ -17,20 +17,6 @@ struct stable_node;
 struct mem_cgroup;
 
 #ifdef CONFIG_KSM
-/**
- * struct mm_slot - ksm information per mm that is being scanned
- * @link: link to the mm_slots hash list
- * @mm_list: link into the mm_slots list, rooted in ksm_mm_head
- * @rmap_list: head for this mm_slot's singly-linked list of rmap_items
- * @mm: the mm that this information is valid for
- */
-struct mm_slot {
-	struct hlist_node link;
-	struct list_head mm_list;
-	struct rmap_item *rmap_list;
-	struct mm_struct *mm;
-};
-
 int __ksm_enter(struct mm_struct *mm);
 void __ksm_exit(struct mm_struct *mm);
 int ksm_fork(struct mm_struct *mm, struct mm_struct *oldmm);
