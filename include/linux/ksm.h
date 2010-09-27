@@ -21,11 +21,6 @@ int __ksm_enter(struct mm_struct *mm);
 void __ksm_exit(struct mm_struct *mm);
 int ksm_fork(struct mm_struct *mm, struct mm_struct *oldmm);
 
-static inline void ksm_exit(struct mm_struct *mm)
-{
-	if (test_bit(MMF_VM_MERGEABLE, &mm->flags))
-		__ksm_exit(mm);
-}
 
 /*
  * A KSM page is one of those write-protected "shared pages" or "merged pages"

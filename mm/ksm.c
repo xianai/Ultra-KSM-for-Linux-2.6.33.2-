@@ -145,7 +145,6 @@ static struct rb_root root_unstable_tree = RB_ROOT;
 
 static struct kmem_cache *rmap_item_cache;
 static struct kmem_cache *stable_node_cache;
-static struct kmem_cache *mm_slot_cache;
 
 /* The number of nodes in the stable tree */
 static unsigned long ksm_pages_shared;
@@ -246,10 +245,8 @@ out:
 
 static void __init ksm_slab_free(void)
 {
-	kmem_cache_destroy(mm_slot_cache);
 	kmem_cache_destroy(stable_node_cache);
 	kmem_cache_destroy(rmap_item_cache);
-	mm_slot_cache = NULL;
 }
 
 static inline struct rmap_item *alloc_rmap_item(void)
@@ -283,19 +280,6 @@ static inline void free_stable_node(struct stable_node *stable_node)
 
 /*
 int ksm_fork(struct mm_struct *mm, struct mm_struct *oldmm)
-{
-	struct mm_slot *mm_slot;
-
-        mm_slot = alloc_mm_slot();
-        if (!mm_slot) {
-                printk(KERN_ERR "ksm_enter failure, mm_slot allocation failed\n");
-                return -ENOMEM;
-        }
-
-	if (test_bit(MMF_VM_MERGEABLE, &oldmm->flags))
-		return __ksm_enter(mm_slot, mm);
-	return 0;
-}
 */
 
 static inline int in_stable_tree(struct rmap_item *rmap_item)
@@ -1501,7 +1485,6 @@ static void scan_vma_one_page(struct vm_area_struct *vma)
 	struct mm_struct *mm;
 	unsigned long pages, addr;
 	struct page *page;
-	//struct mm_slot *slot;
 	struct rmap_item *rmap_item;
 
 
@@ -1519,8 +1502,6 @@ static void scan_vma_one_page(struct vm_area_struct *vma)
 	pages = (vma->vm_end - vma->vm_start) / PAGE_SIZE;
 	addr = vma->vm_start + (random32() % pages) * PAGE_SIZE;
 
-	//slot = get_mm_slot(mm);
-	//BUG_ON(!slot);
 
 	page = follow_page(vma, addr, FOLL_GET);
 
@@ -1851,18 +1832,11 @@ static void try_ksm_enter_all_process(void)
 	struct task_struct *p;
 	int err;
 
-/*
-	mm_slot = alloc_mm_slot();
-	if (!mm_slot) {
-		printk(KERN_ERR "ksm_enter failure, mm_slot allocation failed\n");
-		return;
-	}
-*/
+
 	read_lock(&tasklist_lock);
 
 	for_each_process(p) {
-		if (!p->mm || p->flags & PF_KTHREAD ||
-		    test_bit(MMF_VM_MERGEABLE, &p->mm->flags))
+		if (!p->mm || p->flags & PF_KTHREAD)
 			continue;
 
 		//mm = get_task_mm(p);
@@ -1981,10 +1955,6 @@ int __ksm_enter(struct mm_struct *mm)
 
 	printk(KERN_ERR "__ksm_enter: scan process %s\n", mm->owner->comm);
 
-	set_bit(MMF_VM_MERGEABLE, &mm->flags);
-	atomic_inc(&mm->mm_count);
-
-
 
 	for (vma = mm->mmap; vma; vma = vma->vm_next) {
 		//struct scan_rung *rung;
@@ -2012,12 +1982,6 @@ int __ksm_enter(struct mm_struct *mm)
 	return 0;
 }
 
-void __ksm_exit(struct mm_struct *mm)
-{
-	clear_bit(MMF_VM_MERGEABLE, &mm->flags);
-	mmdrop(mm);
-
-}
 
 struct page *ksm_does_need_to_copy(struct page *page,
 			struct vm_area_struct *vma, unsigned long address)

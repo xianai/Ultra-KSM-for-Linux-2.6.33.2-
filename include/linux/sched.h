@@ -485,7 +485,6 @@ extern int get_dumpable(struct mm_struct *mm);
 # define MMF_DUMP_MASK_DEFAULT_ELF	0
 #endif
 					/* leave room for more dump flags */
-#define MMF_VM_MERGEABLE	16	/* KSM may merge identical pages */
 
 #define MMF_INIT_MASK		(MMF_DUMPABLE_MASK | MMF_DUMP_FILTER_MASK)
 
@@ -1313,9 +1312,9 @@ struct task_struct {
 	unsigned long stack_canary;
 #endif
 
-	/* 
+	/*
 	 * pointers to (original) parent process, youngest child, younger sibling,
-	 * older sibling, respectively.  (p->father can be replaced with 
+	 * older sibling, respectively.  (p->father can be replaced with
 	 * p->real_parent->pid)
 	 */
 	struct task_struct *real_parent; /* real parent process */
@@ -2082,7 +2081,7 @@ static inline int dequeue_signal_lock(struct task_struct *tsk, sigset_t *mask, s
 	spin_unlock_irqrestore(&tsk->sighand->siglock, flags);
 
 	return ret;
-}	
+}
 
 extern void block_all_signals(int (*notifier)(void *priv), void *priv,
 			      sigset_t *mask);
