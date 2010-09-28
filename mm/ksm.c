@@ -1534,8 +1534,8 @@ out1:
 static inline unsigned long long random_distinct_num(unsigned long long total,
 						   unsigned long long randomed)
 {
-	return (randomed - div_u64(randomed * randomed * 9 , (10 * total)) +
-		div_u64(randomed * randomed * randomed , (3 * total * total)));
+	return (randomed - div64_u64(randomed * randomed * 9 , (10 * total)) +
+		div64_u64(randomed * randomed * randomed , (3 * total * total)));
 }
 
 static inline unsigned long get_random_sample_num(unsigned long long total,
