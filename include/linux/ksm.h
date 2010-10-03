@@ -17,7 +17,7 @@ struct stable_node;
 struct mem_cgroup;
 
 #ifdef CONFIG_KSM
-int __ksm_enter(struct mm_struct *mm);
+void __ksm_enter(struct mm_struct *mm);
 void __ksm_exit(struct mm_struct *mm);
 int ksm_fork(struct mm_struct *mm, struct mm_struct *oldmm);
 
@@ -46,16 +46,16 @@ static inline void set_page_stable_node(struct page *page,
 				(PAGE_MAPPING_ANON | PAGE_MAPPING_KSM);
 }
 
+/* must be done before linked to mm */
 static inline void ksm_init_vma(struct vm_area_struct *vma)
 {
 	vma->dedup_ratio = 0;
 	vma->ksm_index = -1;
-	INIT_LIST_HEAD(&vma->ksm_list);
 	vma->pages_scanned = 0;
 	vma->pages_to_scan = 0;
 	vma->rung = 0;
-	vma->rmap_list = NULL;
-	vma->rmap_num = 0;
+	//vma->rmap_list = NULL;
+	//vma->rmap_num = 0;
 	vma->vm_flags &= ~VM_MERGEABLE;
 }
 
@@ -96,15 +96,117 @@ void ksm_migrate_page(struct page *newpage, struct page *oldpage);
 
 struct scan_rung {
 	struct list_head vma_list;
-	spinlock_t vma_list_lock;
-	struct semaphore sem;
+	//spinlock_t vma_list_lock;
+	//struct semaphore sem;
 	struct list_head *current_scan;
 	unsigned int pages_to_scan;
-	unsigned char round_finished;
+	unsigned char round_finished; /* rung is ready for the next round */
+	unsigned char fully_scanned;
 	unsigned long scan_ratio;
 	unsigned long vma_num;
-	unsigned long vma_finished;
+	//unsigned long vma_finished;
+	unsigned long scan_turn;
 };
+
+#define CONFIG_KSM_SUPERFASTHASH 1
+
+#ifdef CONFIG_KSM_SHA1
+#define KSM_CHECKSUM_SIZE	5
+#else
+#define KSM_CHECKSUM_SIZE	1
+#endif
+
+/*
+ * A few notes about the KSM scanning process,
+ * to make it easier to understand the data structures below:
+ *
+ * In order to reduce excessive scanning, KSM sorts the memory pages by their
+ * contents into a data structure that holds pointers to the pages' locations.
+ *
+ * Since the contents of the pages may change at any moment, KSM cannot just
+ * insert the pages into a normal sorted tree and expect it to find anything.
+ * Therefore KSM uses two data structures - the stable and the unstable tree.
+ *
+ * The stable tree holds pointers to all the merged pages (ksm pages), sorted
+ * by their contents.  Because each such page is write-protected, searching on
+ * this tree is fully assured to be working (except when pages are unmapped),
+ * and therefore this tree is called the stable tree.
+ *
+ * In addition to the stable tree, KSM uses a second data structure called the
+ * unstable tree: this tree holds pointers to pages which have been found to
+ * be "unchanged for a period of time".  The unstable tree sorts these pages
+ * by their contents, but since they are not write-protected, KSM cannot rely
+ * upon the unstable tree to work correctly - the unstable tree is liable to
+ * be corrupted as its contents are modified, and so it is called unstable.
+ *
+ * KSM solves this problem by several techniques:
+ *
+ * 1) The unstable tree is flushed every time KSM completes scanning all
+ *    memory areas, and then the tree is rebuilt again from the beginning.
+ * 2) KSM will only insert into the unstable tree, pages whose hash value
+ *    has not changed since the previous scan of all memory areas.
+ * 3) The unstable tree is a RedBlack Tree - so its balancing is based on the
+ *    colors of the nodes and not on their contents, assuring that even when
+ *    the tree gets "corrupted" it won't get out of balance, so scanning time
+ *    remains the same (also, searching and inserting nodes in an rbtree uses
+ *    the same algorithm, so we have no overhead when we flush and rebuild).
+ * 4) KSM never flushes the stable tree, which means that even if it were to
+ *    take 10 attempts to find a page in the unstable tree, once it is found,
+ *    it is secured in the stable tree.  (When we scan a new page, we first
+ *    compare it against the stable tree, and then against the unstable tree.)
+ */
+
+/**
+ * struct stable_node - node of the stable rbtree
+ * @node: rb node of this ksm page in the stable tree
+ * @hlist: hlist head of rmap_items using this ksm page
+ * @kpfn: page frame number of this ksm page
+ */
+struct stable_node {
+	struct rb_node node;
+	struct hlist_head hlist;
+	unsigned long kpfn;
+	u32 checksum[KSM_CHECKSUM_SIZE];
+	struct vm_area_struct *old_vma;
+};
+
+/**
+ * struct rmap_item - reverse mapping item for virtual addresses
+ * @rmap_list: next rmap_item in mm_slot's singly-linked rmap_list
+ * @anon_vma: pointer to anon_vma for this mm,address, when in stable tree
+ * @mm: the memory structure this rmap_item is pointing into
+ * @address: the virtual address this rmap_item tracks (+ flags in low bits)
+ * @oldchecksum: previous checksum of the page at that virtual address
+ * @node: rb node of this rmap_item in the unstable tree
+ * @head: pointer to stable_node heading this list in the stable tree
+ * @hlist: link into hlist of rmap_items hanging off that stable_node
+ */
+struct rmap_item {
+	struct anon_vma *anon_vma;	/* when stable */
+	struct vm_area_struct *vma;
+	unsigned long address;	/* + low bits used for flags below */
+	/* Appendded to (un)stable tree on which scan round */
+	unsigned long append_round;
+
+	/* Which rung scan turn it was last scanned */
+	unsigned long last_scan;
+
+	u32 oldchecksum[KSM_CHECKSUM_SIZE];	/* when unstable */
+	union {
+		struct rb_node node;	/* when node of unstable tree */
+		struct {		/* when listed from stable tree */
+			struct stable_node *head;
+			struct hlist_node hlist;
+		};
+	};
+};
+
+union rmap_list_entry {
+	struct rmap_item *item;
+	unsigned long addr;
+};
+
+
 
 //extern struct semaphore ksm_scan_sem;
 #else  /* !CONFIG_KSM */

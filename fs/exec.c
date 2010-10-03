@@ -247,14 +247,14 @@ static int __bprm_mm_init(struct linux_binprm *bprm)
 	vma->vm_start = vma->vm_end - PAGE_SIZE;
 	vma->vm_flags = VM_STACK_FLAGS;
 	vma->vm_page_prot = vm_get_page_prot(vma->vm_flags);
+#ifdef CONFIG_KSM
+	ksm_init_vma(vma);
+#endif
 	err = insert_vm_struct(mm, vma);
 	if (err)
 		goto err;
 
 	mm->stack_vm = mm->total_vm = 1;
-#ifdef CONFIG_KSM
-		ksm_init_vma(vma);
-#endif
 	up_write(&mm->mmap_sem);
 	bprm->p = vma->vm_end - sizeof(void *);
 	return 0;

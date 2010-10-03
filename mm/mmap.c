@@ -600,6 +600,9 @@ again:			remove_next = 1 + (end > next->vm_end);
 	vma->vm_start = start;
 	vma->vm_end = end;
 	vma->vm_pgoff = pgoff;
+#ifdef CONFIG_KSM
+		ksm_remove_vma(vma);
+#endif
 	if (adjust_next) {
 		next->vm_start += adjust_next << PAGE_SHIFT;
 		next->vm_pgoff += adjust_next;
@@ -2144,10 +2147,10 @@ unsigned long do_brk(unsigned long addr, unsigned long len)
 	vma->vm_pgoff = pgoff;
 	vma->vm_flags = flags;
 	vma->vm_page_prot = vm_get_page_prot(flags);
-	vma_link(mm, vma, prev, rb_link, rb_parent);
 #ifdef CONFIG_KSM
 		ksm_init_vma(vma);
 #endif
+	vma_link(mm, vma, prev, rb_link, rb_parent);
 out:
 	mm->total_vm += len >> PAGE_SHIFT;
 	if (flags & VM_LOCKED) {
@@ -2385,7 +2388,9 @@ int install_special_mapping(struct mm_struct *mm,
 
 	vma->vm_ops = &special_mapping_vmops;
 	vma->vm_private_data = pages;
-
+#ifdef CONFIG_KSM
+	ksm_init_vma(vma);
+#endif
 	if (unlikely(insert_vm_struct(mm, vma))) {
 		kmem_cache_free(vm_area_cachep, vma);
 		return -ENOMEM;

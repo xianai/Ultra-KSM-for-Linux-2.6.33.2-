@@ -192,12 +192,11 @@ struct vm_area_struct {
         unsigned long dedup_ratio;
         int ksm_index; /* -1 if vma is not in inter-table,
                                 positive otherwise */
-        struct list_head ksm_list;
         unsigned long pages_scanned;
         unsigned long pages_to_scan;
         struct scan_rung *rung;
-	struct rmap_item *rmap_list;
-	unsigned long rmap_num;
+	union rmap_list_entry *rmap_list;
+	unsigned long rand_index;
 #endif
 };
 
