@@ -189,8 +189,8 @@ struct rmap_item {
 	unsigned long append_round;
 
 	/* Which rung scan turn it was last scanned */
-	unsigned long last_scan;
-
+	//unsigned long last_scan;
+	unsigned long entry_index;
 	u32 oldchecksum[KSM_CHECKSUM_SIZE];	/* when unstable */
 	union {
 		struct rb_node node;	/* when node of unstable tree */
@@ -199,12 +199,16 @@ struct rmap_item {
 			struct hlist_node hlist;
 		};
 	};
-};
+} __attribute__((aligned(4)));
 
-union rmap_list_entry {
-	struct rmap_item *item;
-	unsigned long addr;
-};
+struct rmap_list_entry {
+	union {
+		struct rmap_item *item;
+		unsigned long addr;
+	};
+	// lowest bit is used for is_addr tag
+	//unsigned char is_addr;
+} __attribute__((aligned(4))); // 4 aligned to fit in to pages
 
 
 

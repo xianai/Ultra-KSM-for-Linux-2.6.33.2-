@@ -189,14 +189,17 @@ struct vm_area_struct {
 	struct mempolicy *vm_policy;	/* NUMA policy for the VMA */
 #endif
 #ifdef CONFIG_KSM
+	struct list_head ksm_list;
         unsigned long dedup_ratio;
         int ksm_index; /* -1 if vma is not in inter-table,
                                 positive otherwise */
         unsigned long pages_scanned;
         unsigned long pages_to_scan;
         struct scan_rung *rung;
-	union rmap_list_entry *rmap_list;
-	unsigned long rand_index;
+	struct rmap_list_entry *rmap_list;
+	struct page *rmap_list_pool;
+	struct unsigned long *pool_counts;
+	unsigned long pool_size;
 #endif
 };
 

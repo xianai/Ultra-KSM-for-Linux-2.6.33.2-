@@ -596,13 +596,13 @@ again:			remove_next = 1 + (end > next->vm_end);
 		if (adjust_next)
 			vma_prio_tree_remove(next, root);
 	}
-
-	vma->vm_start = start;
-	vma->vm_end = end;
-	vma->vm_pgoff = pgoff;
 #ifdef CONFIG_KSM
 		ksm_remove_vma(vma);
 #endif
+	vma->vm_start = start;
+	vma->vm_end = end;
+	vma->vm_pgoff = pgoff;
+
 	if (adjust_next) {
 		next->vm_start += adjust_next << PAGE_SHIFT;
 		next->vm_pgoff += adjust_next;
