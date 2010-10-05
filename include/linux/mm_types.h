@@ -194,11 +194,11 @@ struct vm_area_struct {
         int ksm_index; /* -1 if vma is not in inter-table,
                                 positive otherwise */
         unsigned long pages_scanned;
+	unsigned long last_scanned;
         unsigned long pages_to_scan;
         struct scan_rung *rung;
-	struct rmap_list_entry *rmap_list;
-	struct page *rmap_list_pool;
-	struct unsigned long *pool_counts;
+	struct page **rmap_list_pool;
+	unsigned long *pool_counts;
 	unsigned long pool_size;
 #endif
 };

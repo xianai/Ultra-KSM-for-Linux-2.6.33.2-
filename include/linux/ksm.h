@@ -49,11 +49,15 @@ static inline void set_page_stable_node(struct page *page,
 /* must be done before linked to mm */
 static inline void ksm_init_vma(struct vm_area_struct *vma)
 {
+	INIT_LIST_HEAD(&vma->ksm_list);
 	vma->dedup_ratio = 0;
 	vma->ksm_index = -1;
 	vma->pages_scanned = 0;
 	vma->pages_to_scan = 0;
 	vma->rung = 0;
+	vma->rmap_list_pool = NULL;
+	vma->pool_counts = NULL;
+	vma->pool_size = 0;
 	//vma->rmap_list = NULL;
 	//vma->rmap_num = 0;
 	vma->vm_flags &= ~VM_MERGEABLE;
