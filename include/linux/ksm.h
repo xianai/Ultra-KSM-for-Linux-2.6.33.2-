@@ -54,6 +54,7 @@ static inline void ksm_init_vma(struct vm_area_struct *vma)
 	vma->ksm_index = -1;
 	vma->pages_scanned = 0;
 	vma->pages_to_scan = 0;
+	vma->last_scanned = 0;
 	vma->rung = 0;
 	vma->rmap_list_pool = NULL;
 	vma->pool_counts = NULL;

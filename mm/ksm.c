@@ -1940,7 +1940,9 @@ static unsigned long cal_dedup_ratio_clear(struct vm_area_struct *vma)
 	}
 
 	index = intertab_vma_offset(vma->ksm_index, vma->ksm_index);
-	dedup_num += ksm_inter_vma_table[index] * pages1 / scanned1;
+	BUG_ON(ksm_inter_vma_table[index] && !scanned1);
+	if (ksm_inter_vma_table[index])
+		dedup_num += ksm_inter_vma_table[index] * pages1 / scanned1;
 	ksm_inter_vma_table[index] = 0;
 
 	return (dedup_num * KSM_SCAN_RATIO_MAX / pages1);
