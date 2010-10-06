@@ -1374,7 +1374,8 @@ static inline unsigned long get_pool_index(struct vm_area_struct *vma,
 	unsigned long pool_index;
 
 	pool_index = (sizeof(struct rmap_list_entry *) * index) >> PAGE_SHIFT;
-	BUG_ON(pool_index >= vma->pool_size);
+	if (pool_index >= vma->pool_size)
+		while (true);
 	return pool_index;
 }
 
@@ -1486,6 +1487,10 @@ static inline void dec_rmap_list_pool_count(struct vm_area_struct *vma,
 	vma->pool_counts[pool_index]--;
 }
 
+static inline int entry_has_rmap(struct rmap_list_entry *entry)
+{
+	return (!is_addr(entry->addr) && entry->item);
+}
 
 static inline void swap_entries(struct rmap_list_entry *entry1,
 				unsigned long index1,
@@ -1494,24 +1499,25 @@ static inline void swap_entries(struct rmap_list_entry *entry1,
 {
 	struct rmap_list_entry tmp;
 
-	BUG_ON(entry_is_new(entry1) || entry_is_new(entry2));
+	/* swapping two new entries is meaningless */
+	BUG_ON(entry_is_new(entry1) && entry_is_new(entry2));
 
 	tmp = *entry1;
 	*entry1 = *entry2;
 	*entry2 = tmp;
 
-	if (!is_addr(entry1->addr)) {
+	if (entry_has_rmap(entry1)) {
 		entry1->item->entry_index = index1;
 	}
 
-	if (!is_addr(entry2->addr)) {
+	if (entry_has_rmap(entry2)) {
 		entry2->item->entry_index = index2;
 	}
 
-	if (!is_addr(entry1->addr) && is_addr(entry2->addr)) {
+	if (entry_has_rmap(entry1) && !entry_has_rmap(entry2)) {
 		inc_rmap_list_pool_count(entry1->item->vma, index1);
 		dec_rmap_list_pool_count(entry1->item->vma, index2);
-	} else if (is_addr(entry1->addr) && !is_addr(entry2->addr)) {
+	} else if (!entry_has_rmap(entry1) && entry_has_rmap(entry2)) {
 		inc_rmap_list_pool_count(entry2->item->vma, index2);
 		dec_rmap_list_pool_count(entry2->item->vma, index1);
 	}
@@ -1543,7 +1549,7 @@ static inline int pool_entry_boundary(unsigned long index)
 	unsigned long linear_addr;
 
 	linear_addr = sizeof(struct rmap_list_entry *) * index;
-	return (!offset_in_page(linear_addr));
+	return (index && !offset_in_page(linear_addr));
 }
 
 static inline void try_free_last_pool(struct vm_area_struct *vma,
@@ -1581,6 +1587,8 @@ static void sort_rmap_entry_list(struct vm_area_struct *vma)
 	unsigned long i, j;
 	struct rmap_list_entry *entry, *swap_entry;
 
+	//printk(KERN_ERR "KSM: sort list of vma=%x vma->pages_scanned=%lu\n", (unsigned int)vma, vma->pages_scanned);
+
 	entry = get_rmap_list_entry(vma, 0, 0);
 	for (i = 0; i < vma_pages(vma); ) {
 
@@ -1616,7 +1624,7 @@ skip_whole_pool:
 		continue;
 
 next_entry:
-		if (i >= vma_pages(vma) ||
+		if (i >= vma_pages(vma) - 1 ||
 		    !within_same_pool(vma, i, i + 1)) {
 			put_rmap_list_entry(vma, i);
 			if (i + 1 < vma_pages(vma))
@@ -1651,6 +1659,7 @@ next_entry:
 		if (!has_rmap) {
 			BUG_ON(vma->pool_counts[i]);
 			__free_page(vma->rmap_list_pool[i]);
+			vma->rmap_list_pool[i] = NULL;
 		}
 	}
 }
@@ -1665,7 +1674,7 @@ static struct rmap_item *get_next_rmap_item(struct vm_area_struct *vma,
 	scan_index = vma->pages_scanned % vma_pages(vma);
 
 	if (pool_entry_boundary(scan_index))
-		try_free_last_pool(vma, scan_index);
+		try_free_last_pool(vma, scan_index - 1);
 
 	if (vma->pages_scanned && !scan_index) {
 		sort_rmap_entry_list(vma);
@@ -1682,9 +1691,10 @@ static struct rmap_item *get_next_rmap_item(struct vm_area_struct *vma,
 	swap_index = scan_index + (random32() % rand_range);
 
 	if (swap_index != scan_index) {
+		//// if swap entry and scan entry is within same pool
 		swap_entry = get_rmap_list_entry(vma, swap_index, 1);
 		if (entry_is_new(swap_entry)) {
-			swap_entry->addr = get_index_orig_addr(vma, scan_index);
+			swap_entry->addr = get_index_orig_addr(vma, swap_index);
 			set_is_addr(swap_entry->addr);
 		}
 		swap_entries(scan_entry, scan_index, swap_entry, swap_index);
@@ -1693,6 +1703,13 @@ static struct rmap_item *get_next_rmap_item(struct vm_area_struct *vma,
 
 	addr = get_entry_address(vma, scan_entry, scan_index);
 	item = get_entry_item(scan_entry);
+
+
+/*
+	printk(KERN_ERR "KSM: scan vma=%x page_index=%lu scan_index=%lu swap_index=%lu\n",
+	       (unsigned int)vma, (addr - vma->vm_start) >> PAGE_SHIFT, scan_index, swap_index);
+*/
+
 	BUG_ON(addr > vma->vm_end || addr < vma->vm_start );
 
 
@@ -1791,13 +1808,13 @@ static int scan_vma_one_page(struct vm_area_struct *vma)
 
 
 	if(!down_read_trylock(&mm->mmap_sem)) {
-		printk(KERN_ERR "Cannot lock vma %s\n", mm->owner->comm);
+		printk(KERN_ERR "KSM: Cannot lock vma %s\n", mm->owner->comm);
 		return 1;
 	}
 
 	BUG_ON(!vma_need_scan(vma));
 	if (ksm_test_exit(mm))
-		goto out1;
+		goto out;
 /*
 	pages = vma_pages(vma);
 
@@ -1814,6 +1831,7 @@ static int scan_vma_one_page(struct vm_area_struct *vma)
 		goto out1;
 	}
 
+
 	if (PageKsm(page) && in_stable_tree(rmap_item))
 		goto out2;
 
@@ -1824,7 +1842,7 @@ out1:
 	//rmap_item->last_scan = vma->rung->scan_turn;
 	vma->rung->pages_to_scan--;
 	vma->pages_scanned++;
-
+out:
 	up_read(&mm->mmap_sem);
 	return 0;
 }
@@ -1877,7 +1895,7 @@ static inline void vma_rung_enter(struct vm_area_struct *vma,
 	vma->pages_to_scan = pages_to_scan;
 	//vma->pages_scanned = 0;
 	vma->rung->vma_num++;
-	printk(KERN_ERR "KSM: %s enter ladder %d\n", vma->vm_mm->owner->comm, (rung - &ksm_scan_ladder[0]));
+	printk(KERN_ERR "KSM: %s enter ladder %d vma=%x\n", vma->vm_mm->owner->comm, (rung - &ksm_scan_ladder[0]), (unsigned int)vma);
 }
 
 static inline void vma_rung_up(struct vm_area_struct *vma)
@@ -1906,12 +1924,14 @@ static unsigned long cal_dedup_ratio_clear(struct vm_area_struct *vma)
 	if (!vma->pages_scanned)
 		return 0;
 
-	BUG_ON(vma->pages_scanned > pages1);
+	//BUG_ON(vma->pages_scanned > pages1);
 	scanned1 = vma->pages_scanned - vma->last_scanned;
 	BUG_ON(scanned1 > vma->pages_scanned);
+/*
 	if (!scanned1) {
 		printk(KERN_ERR "KSM: pages_scanned=%lu\n", vma->pages_scanned);
 	}
+*/
 
 	for (i = 0; i < ksm_vma_table_index_end; i++) {
 		struct vm_area_struct *vma2 = ksm_vma_table[i];
@@ -1922,14 +1942,16 @@ static unsigned long cal_dedup_ratio_clear(struct vm_area_struct *vma)
 
 		pages2 = vma_pages(vma2);
 
-		BUG_ON(vma2->pages_scanned > pages2);
+		//BUG_ON(vma2->pages_scanned > pages2);
 		scanned2 = vma2->pages_scanned - vma2->last_scanned;
 		//vma2->last_scanned = vma2->pages_scanned;
 		BUG_ON(scanned2 > vma2->pages_scanned);
 
+/*
 		if (!scanned2) {
 			printk(KERN_ERR "KSM: pages_scanned=%lu\n", vma2->pages_scanned);
 		}
+*/
 		index = intertab_vma_offset(vma->ksm_index, i);
 		BUG_ON(ksm_inter_vma_table[index] && (!scanned1 || !scanned2));
 		if (ksm_inter_vma_table[index]) {
@@ -2023,6 +2045,11 @@ static void inline cal_ladder_pages_to_scan(unsigned int num)
 	}
 }
 
+static inline int vma_fully_scanned(struct vm_area_struct *vma)
+{
+	return (vma->pages_scanned && !(vma->pages_scanned % vma_pages(vma)));
+}
+
 /**
  * ksm_do_scan  - the ksm scanner main worker function.
  * @scan_npages - number of pages we want to scan before we return.
@@ -2031,43 +2058,37 @@ static void ksm_do_scan(void)
 {
 	struct vm_area_struct *vma;
 	struct list_head *next_scan;
-	unsigned char round_finished = 1;
+	unsigned char round_finished = 1, all_rungs_emtpy;
 	int i;
 
 
+	mutex_lock(&ksm_scan_sem);
 	//printk(KERN_ERR "****ksm_do_scan****\n");
 	for (i = ksm_scan_ladder_size - 1; i >= 0; i--) {
 		struct scan_rung *rung = &ksm_scan_ladder[i];
-		if (list_empty(&rung->vma_list))
-			continue;
-
-		//if (rung->round_finished) {
-			//scan_bonus += rung->pages_to_scan;
-			//continue;
-		//}
-
-		//rung->pages_to_scan += scan_bonus;
-		if (!rung->pages_to_scan)
-			continue;
 
 		while (rung->pages_to_scan) {
 			int vma_busy = 0, n = 1;
-			mutex_lock(&ksm_scan_sem);
+
+			if (list_empty(&rung->vma_list))
+				break;
+
 			vma = list_entry(rung->current_scan,
 					 struct vm_area_struct, ksm_list);
 
 
 			BUG_ON(list_empty(&vma->ksm_list));
 			BUG_ON(!vma_pages(vma));
-			if (vma->pages_scanned < vma_pages(vma)){
-				vma_busy = scan_vma_one_page(vma);
+
+			vma_busy = scan_vma_one_page(vma);
+			if (!vma_fully_scanned(vma)){
 				rung->fully_scanned = 0;
 			}
 
-			BUG_ON(vma->pages_scanned > vma_pages(vma));
+			//BUG_ON(vma->pages_scanned > vma_pages(vma));
 			if ((vma->pages_scanned &&
 			     vma->pages_scanned % vma->pages_to_scan == 0)
-			    || vma->pages_scanned == vma_pages(vma)) {
+			    || vma_fully_scanned(vma)) {
 				//vma->pages_scanned = 0;
 				next_scan = rung->current_scan->next;
 				if (next_scan == &rung->vma_list) {
@@ -2093,18 +2114,25 @@ static void ksm_do_scan(void)
 			} else {
 				n = 1;
 			}
+			mutex_lock(&ksm_scan_sem);
 		}
-
 	}
+	mutex_unlock(&ksm_scan_sem);
 
+	all_rungs_emtpy = 1;
 	for (i = 0; i < ksm_scan_ladder_size; i++) {
 		struct scan_rung *rung = &ksm_scan_ladder[i];
 
-		if (!list_empty(&rung->vma_list) && !rung->round_finished) {
-			round_finished = 0;
+		if (!list_empty(&rung->vma_list)) {
+			all_rungs_emtpy = 0;
+			if (!rung->round_finished)
+				round_finished = 0;
 			break;
 		}
 	}
+
+	if (all_rungs_emtpy)
+		round_finished = 0;
 
 	mutex_lock(&ksm_scan_sem);
 pre_next_round:
@@ -2142,10 +2170,14 @@ static void try_ksm_enter_all_process(void)
 		if (!p->mm || p->flags & PF_KTHREAD)
 			continue;
 
+/*
+		if (strcmp(p->comm, "best_case"))
+			continue;
+*/
+
 		//mm = get_task_mm(p);
 		task_lock(p);
 		if (p->mm) {
-			//printk(KERN_ERR "Adding new task %s\n", mm->owner->comm);
 			if (!down_read_trylock(&p->mm->mmap_sem)) {
 				task_unlock(p);
 				goto out;
@@ -2242,11 +2274,13 @@ static void ksm_vma_enter(struct vm_area_struct *vma)
 
 		pool_size = vma_pool_size(vma);
 
-		vma->rmap_list_pool = kzalloc(sizeof(struct page*) * pool_size, GFP_KERNEL | GFP_ATOMIC);
-		vma->pool_counts = kzalloc(sizeof(unsigned long) * pool_size, GFP_KERNEL | GFP_ATOMIC);
+		vma->rmap_list_pool = kzalloc(sizeof(struct page*) * pool_size, GFP_NOWAIT);
+		vma->pool_counts = kzalloc(sizeof(unsigned long) * pool_size, GFP_NOWAIT);
 		vma->pool_size = pool_size;
 		BUG_ON(!vma->rmap_list_pool);
 		BUG_ON(!vma->pool_counts);
+		printk(KERN_ERR "Added vma=%x from task %s pool_size=%lu\n",
+		       (unsigned long)vma, vma->vm_mm->owner->comm, pool_size);
 	}
 
 
