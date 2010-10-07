@@ -516,6 +516,15 @@ void vma_adjust(struct vm_area_struct *vma, unsigned long start,
 	long adjust_next = 0;
 	int remove_next = 0;
 
+/*
+ * to avoid deadlock, ksm_remove_vma must be done before any spin_lock is
+ * acquired
+ */
+#ifdef CONFIG_KSM
+		ksm_remove_vma(vma);
+#endif
+
+
 	if (next && !insert) {
 		if (end >= next->vm_end) {
 			/*
@@ -596,9 +605,6 @@ again:			remove_next = 1 + (end > next->vm_end);
 		if (adjust_next)
 			vma_prio_tree_remove(next, root);
 	}
-#ifdef CONFIG_KSM
-		ksm_remove_vma(vma);
-#endif
 	vma->vm_start = start;
 	vma->vm_end = end;
 	vma->vm_pgoff = pgoff;

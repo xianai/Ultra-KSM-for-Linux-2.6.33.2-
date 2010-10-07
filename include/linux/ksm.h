@@ -55,6 +55,7 @@ static inline void ksm_init_vma(struct vm_area_struct *vma)
 	vma->pages_scanned = 0;
 	vma->pages_to_scan = 0;
 	vma->last_scanned = 0;
+	vma->need_sort = 0;
 	vma->rung = 0;
 	vma->rmap_list_pool = NULL;
 	vma->pool_counts = NULL;
@@ -176,6 +177,21 @@ struct stable_node {
 };
 
 /**
+ * struct node_vma - group rmap_items linked in a same stable
+ * node together.
+ */
+struct node_vma {
+	union {
+		struct vm_area_struct *vma;
+		unsigned long key;  /* vma is used as key sorted on hlist */
+	};
+	struct hlist_node hlist;
+	struct hlist_head rmap_hlist;
+	struct stable_node *head;
+	unsigned long last_update;
+};
+
+/**
  * struct rmap_item - reverse mapping item for virtual addresses
  * @rmap_list: next rmap_item in mm_slot's singly-linked rmap_list
  * @anon_vma: pointer to anon_vma for this mm,address, when in stable tree
@@ -199,8 +215,8 @@ struct rmap_item {
 	u32 oldchecksum[KSM_CHECKSUM_SIZE];	/* when unstable */
 	union {
 		struct rb_node node;	/* when node of unstable tree */
-		struct {		/* when listed from stable tree */
-			struct stable_node *head;
+		struct {		/* when listed from stable tree's node_vma */
+			struct node_vma *head;
 			struct hlist_node hlist;
 		};
 	};

@@ -58,6 +58,7 @@ static struct rb_root root_unstable_tree = RB_ROOT;
 
 static struct kmem_cache *rmap_item_cache;
 static struct kmem_cache *stable_node_cache;
+static struct kmem_cache *node_vma_cache;
 
 /* The number of nodes in the stable tree */
 static unsigned long ksm_pages_shared;
@@ -158,8 +159,13 @@ static int __init ksm_slab_init(void)
 	if (!stable_node_cache)
 		goto out_free1;
 
+	node_vma_cache = KSM_KMEM_CACHE(node_vma, 0);
+	if (!node_vma_cache)
+		goto out_free2;
+
 	return 0;
 
+out_free2:
 	kmem_cache_destroy(stable_node_cache);
 out_free1:
 	kmem_cache_destroy(rmap_item_cache);
@@ -171,6 +177,23 @@ static void __init ksm_slab_free(void)
 {
 	kmem_cache_destroy(stable_node_cache);
 	kmem_cache_destroy(rmap_item_cache);
+}
+
+static inline struct node_vma *alloc_node_vma(void)
+{
+	struct node_vma *node_vma;
+	node_vma = kmem_cache_zalloc(node_vma_cache, GFP_KERNEL);
+	if (node_vma) {
+		INIT_HLIST_HEAD(&node_vma->rmap_hlist);
+		INIT_HLIST_NODE(&node_vma->hlist);
+		node_vma->last_update = 0;
+	}
+	return node_vma;
+}
+
+static inline void free_node_vma(struct node_vma *node_vma)
+{
+	kmem_cache_free(node_vma_cache, node_vma);
 }
 
 static inline struct rmap_item *alloc_rmap_item(void)
@@ -357,9 +380,26 @@ failout:
 
 static void remove_node_from_stable_tree(struct stable_node *stable_node)
 {
+	struct node_vma *node_vma;
 	struct rmap_item *rmap_item;
-	struct hlist_node *hlist;
+	struct hlist_node *hlist, *rmap_hlist, *n;
 
+	hlist_for_each_entry_safe(node_vma, hlist, n,
+				  &stable_node->hlist, hlist) {
+		hlist_for_each_entry(rmap_item, rmap_hlist,
+				     &node_vma->rmap_hlist, hlist) {
+			if (rmap_item->hlist.next)
+				ksm_pages_sharing--;
+			else
+				ksm_pages_shared--;
+			drop_anon_vma(rmap_item);
+			rmap_item->address &= PAGE_MASK;
+		}
+		free_node_vma(node_vma);
+		cond_resched();
+	}
+
+/*
 	hlist_for_each_entry(rmap_item, hlist, &stable_node->hlist, hlist) {
 		if (rmap_item->hlist.next)
 			ksm_pages_sharing--;
@@ -369,6 +409,7 @@ static void remove_node_from_stable_tree(struct stable_node *stable_node)
 		rmap_item->address &= PAGE_MASK;
 		cond_resched();
 	}
+*/
 
 	rb_erase(&stable_node->node, &root_stable_tree);
 	free_stable_node(stable_node);
@@ -438,9 +479,11 @@ static void remove_rmap_item_from_tree(struct rmap_item *rmap_item)
 {
 	if (rmap_item->address & STABLE_FLAG) {
 		struct stable_node *stable_node;
+		struct node_vma *node_vma;
 		struct page *page;
 
-		stable_node = rmap_item->head;
+		node_vma = rmap_item->head;
+		stable_node = node_vma->head;
 		page = get_ksm_page(stable_node);
 		if (!page)
 			goto out;
@@ -449,6 +492,11 @@ static void remove_rmap_item_from_tree(struct rmap_item *rmap_item)
 		hlist_del(&rmap_item->hlist);
 		unlock_page(page);
 		put_page(page);
+
+		if (hlist_empty(&node_vma->rmap_hlist)) {
+			hlist_del(&node_vma->hlist);
+			free_node_vma(node_vma);
+		}
 
 		if (stable_node->hlist.first)
 			ksm_pages_sharing--;
@@ -506,6 +554,7 @@ void ksm_remove_vma(struct vm_area_struct *vma)
 	int i, j;
 	struct rmap_list_entry *entry;
 
+	might_sleep();
 	/* mutex lock contention maybe intensive, other idea ? */
 	mutex_lock(&ksm_scan_sem);
 	if (list_empty(&vma->ksm_list) || !vma->rung) {
@@ -1196,26 +1245,6 @@ struct rmap_item *unstable_tree_search_insert(struct rmap_item *rmap_item,
 	return NULL;
 }
 
-/*
- * stable_tree_append - add another rmap_item to the linked list of
- * rmap_items hanging off a given node of the stable tree, all sharing
- * the same ksm page.
- */
-static void stable_tree_append(struct rmap_item *rmap_item,
-			       struct stable_node *stable_node)
-{
-	rmap_item->head = stable_node;
-	rmap_item->address |= STABLE_FLAG;
-	rmap_item->append_round = ksm_scan_round;
-	hlist_add_head(&rmap_item->hlist, &stable_node->hlist);
-
-	if (rmap_item->hlist.next)
-		ksm_pages_sharing++;
-	else
-		ksm_pages_shared++;
-}
-
-
 static void enter_inter_vma_table(struct vm_area_struct *vma)
 {
 	unsigned int i;
@@ -1236,8 +1265,8 @@ static void enter_inter_vma_table(struct vm_area_struct *vma)
 	BUG_ON(ksm_vma_table_index_end > ksm_vma_table_size - 1);
 }
 
-static void adjust_intertab_pair(struct vm_area_struct *vma1,
-				 struct vm_area_struct *vma2)
+static inline void inc_vma_intertab_pair(struct vm_area_struct *vma1,
+					 struct vm_area_struct *vma2)
 {
 	unsigned long offset;
 
@@ -1252,25 +1281,110 @@ static void adjust_intertab_pair(struct vm_area_struct *vma1,
 	BUG_ON(!ksm_inter_vma_table[offset]);
 }
 
-static void update_intertab_unstable(struct rmap_item *item1,
-				     struct rmap_item *item2)
+static inline void dec_vma_intertab_pair(struct vm_area_struct *vma1,
+					 struct vm_area_struct *vma2)
 {
-	adjust_intertab_pair(item1->vma, item2->vma);
+	unsigned long offset;
+	BUG_ON(vma1->ksm_index == -1 || vma2->ksm_index == -1);
+
+	offset = intertab_vma_offset(vma1->ksm_index, vma2->ksm_index);
+	BUG_ON(!ksm_inter_vma_table[offset]);
+	ksm_inter_vma_table[offset]--;
 }
 
-static void update_intertab_stable(struct rmap_item *in_item, struct page *kpage)
+
+/*
+ * stable_tree_append - add another rmap_item to the linked list of
+ * rmap_items hanging off a given node of the stable tree, all sharing
+ * the same ksm page.
+ */
+static void stable_tree_append(struct rmap_item *rmap_item,
+			       struct stable_node *stable_node)
 {
-	struct stable_node *node;
-	struct rmap_item *item;
-	struct hlist_node *n;
+	struct node_vma *node_vma = NULL, *new_node_vma, *node_vma_iter = NULL;
+	struct hlist_node *hlist, *cont_p;
+	unsigned long key = (unsigned long)rmap_item->vma;
 
-	node = page_stable_node(kpage);
+	//rmap_item->head = stable_node;
+	rmap_item->address |= STABLE_FLAG;
+	rmap_item->append_round = ksm_scan_round;
 
-	hlist_for_each_entry(item, n, &node->hlist, hlist) {
-		if (item->append_round == ksm_scan_round) {
-			adjust_intertab_pair(in_item->vma, item->vma);
+	hlist_for_each_entry(node_vma, hlist, &stable_node->hlist, hlist) {
+		if (node_vma->last_update == ksm_scan_round) {
+			inc_vma_intertab_pair(rmap_item->vma, node_vma->vma);
 		}
+		if (node_vma->key >= key)
+			break;
 	}
+
+	cont_p = hlist;
+
+	if (node_vma && node_vma->key == key) {
+		if (node_vma->last_update == ksm_scan_round) {
+			/**
+			 * we consider this page a inner duplicate, cancel
+			 * other updates
+			 */
+			hlist_for_each_entry(node_vma_iter, hlist,
+					     &stable_node->hlist, hlist) {
+				if (node_vma_iter->key == key)
+					break;
+
+				/* need only the same vma inc */
+				if (node_vma_iter->last_update == ksm_scan_round) {
+					dec_vma_intertab_pair(rmap_item->vma,
+							      node_vma_iter->vma);
+				}
+			}
+		} else {
+			/**
+			 * Although it's same vma, it contains no duplicate for this
+			 * round. Continue scan other vma.
+			 */
+			hlist_for_each_entry_continue(node_vma_iter, hlist, hlist) {
+				if (node_vma_iter->last_update == ksm_scan_round) {
+					inc_vma_intertab_pair(rmap_item->vma,
+							      node_vma_iter->vma);
+				}
+			}
+
+		}
+		goto node_vma_ok;
+	}
+
+	/* no same vma already in node, alloc a new node_vma */
+	new_node_vma = alloc_node_vma();
+	BUG_ON(!new_node_vma);
+	new_node_vma->head = stable_node;
+	new_node_vma->vma = rmap_item->vma;
+
+	if (!node_vma)
+		hlist_add_head(&new_node_vma->hlist, &stable_node->hlist);
+	else if (node_vma->key != key) {
+		if (node_vma->key < key)
+			hlist_add_after(&node_vma->hlist, &new_node_vma->hlist);
+		else {
+			hlist_for_each_entry_continue(node_vma_iter, cont_p, hlist) {
+				if (node_vma_iter->last_update == ksm_scan_round) {
+					inc_vma_intertab_pair(rmap_item->vma,
+							      node_vma_iter->vma);
+				}
+			}
+			hlist_add_before(&new_node_vma->hlist, &node_vma->hlist);
+		}
+
+	}
+	node_vma = new_node_vma;
+
+node_vma_ok: /* ok, ready to add to the list */
+	rmap_item->head = node_vma;
+	hlist_add_head(&rmap_item->hlist, &node_vma->rmap_hlist);
+	node_vma->last_update = ksm_scan_round;
+
+	if (rmap_item->hlist.next)
+		ksm_pages_sharing++;
+	else
+		ksm_pages_shared++;
 }
 
 /*
@@ -1306,8 +1420,10 @@ static void cmp_and_merge_page(struct page *page, struct rmap_item *rmap_item)
 			 * add its rmap_item to the stable tree.
 			 */
 			lock_page(kpage);
+/*
 			if (!same_page)
 				update_intertab_stable(rmap_item, kpage);
+*/
 			stable_tree_append(rmap_item, page_stable_node(kpage));
 			unlock_page(kpage);
 		}
@@ -1342,7 +1458,9 @@ static void cmp_and_merge_page(struct page *page, struct rmap_item *rmap_item)
 		 * tree, and insert it instead as new node in the stable tree.
 		 */
 		if (kpage) {
+/*
 			update_intertab_unstable(rmap_item, tree_rmap_item);
+*/
 			remove_rmap_item_from_tree(tree_rmap_item);
 			lock_page(kpage);
 			stable_node = stable_tree_insert(kpage);
@@ -1561,6 +1679,7 @@ static inline void try_free_last_pool(struct vm_area_struct *vma,
 	if (vma->rmap_list_pool[pool_index] && !vma->pool_counts[pool_index]) {
 		__free_page(vma->rmap_list_pool[pool_index]);
 		vma->rmap_list_pool[pool_index] = NULL;
+		vma->need_sort = 1;
 	}
 
 }
@@ -1662,6 +1781,8 @@ next_entry:
 			vma->rmap_list_pool[i] = NULL;
 		}
 	}
+
+	vma->need_sort = 0;
 }
 
 static struct rmap_item *get_next_rmap_item(struct vm_area_struct *vma,
@@ -1676,7 +1797,7 @@ static struct rmap_item *get_next_rmap_item(struct vm_area_struct *vma,
 	if (pool_entry_boundary(scan_index))
 		try_free_last_pool(vma, scan_index - 1);
 
-	if (vma->pages_scanned && !scan_index) {
+	if (vma->pages_scanned && !scan_index && vma->need_sort) {
 		sort_rmap_entry_list(vma);
 	}
 
@@ -2061,7 +2182,7 @@ static void ksm_do_scan(void)
 	unsigned char round_finished = 1, all_rungs_emtpy;
 	int i;
 
-
+	might_sleep();
 	mutex_lock(&ksm_scan_sem);
 	//printk(KERN_ERR "****ksm_do_scan****\n");
 	for (i = ksm_scan_ladder_size - 1; i >= 0; i--) {
@@ -2370,8 +2491,9 @@ int page_referenced_ksm(struct page *page, struct mem_cgroup *memcg,
 			unsigned long *vm_flags)
 {
 	struct stable_node *stable_node;
+	struct node_vma *node_vma;
 	struct rmap_item *rmap_item;
-	struct hlist_node *hlist;
+	struct hlist_node *hlist, *rmap_hlist;
 	unsigned int mapcount = page_mapcount(page);
 	int referenced = 0;
 	int search_new_forks = 0;
@@ -2382,36 +2504,45 @@ int page_referenced_ksm(struct page *page, struct mem_cgroup *memcg,
 	stable_node = page_stable_node(page);
 	if (!stable_node)
 		return 0;
+
+
 again:
-	hlist_for_each_entry(rmap_item, hlist, &stable_node->hlist, hlist) {
-		struct anon_vma *anon_vma = rmap_item->anon_vma;
-		struct vm_area_struct *vma;
+	hlist_for_each_entry(node_vma, hlist, &stable_node->hlist, hlist) {
+		hlist_for_each_entry(rmap_item, rmap_hlist,
+				     &node_vma->rmap_hlist, hlist) {
+			struct anon_vma *anon_vma = rmap_item->anon_vma;
+			struct vm_area_struct *vma;
 
-		spin_lock(&anon_vma->lock);
-		list_for_each_entry(vma, &anon_vma->head, anon_vma_node) {
-			if (rmap_item->address < vma->vm_start ||
-			    rmap_item->address >= vma->vm_end)
-				continue;
-			/*
-			 * Initially we examine only the vma which covers this
-			 * rmap_item; but later, if there is still work to do,
-			 * we examine covering vmas in other mms: in case they
-			 * were forked from the original since ksmd passed.
-			 */
-			if ((rmap_item->vma == vma) == search_new_forks)
-				continue;
+			spin_lock(&anon_vma->lock);
+			list_for_each_entry(vma, &anon_vma->head,
+					    anon_vma_node) {
+				if (rmap_item->address < vma->vm_start ||
+				    rmap_item->address >= vma->vm_end)
+					continue;
+				/*
+				 * Initially we examine only the vma which
+				 * covers this rmap_item; but later, if there
+				 * is still work to do, we examine covering
+				 * vmas in other mms: in case they were forked
+				 * from the original since ksmd passed.
+				 */
+				if ((rmap_item->vma == vma) == search_new_forks)
+					continue;
 
-			if (memcg && !mm_match_cgroup(vma->vm_mm, memcg))
-				continue;
+				if (memcg && !mm_match_cgroup(vma->vm_mm, memcg))
+					continue;
 
-			referenced += page_referenced_one(page, vma,
-				rmap_item->address, &mapcount, vm_flags);
-			if (!search_new_forks || !mapcount)
-				break;
+				referenced +=
+					page_referenced_one(page, vma,
+							    rmap_item->address,
+							    &mapcount, vm_flags);
+				if (!search_new_forks || !mapcount)
+					break;
+			}
+			spin_unlock(&anon_vma->lock);
+			if (!mapcount)
+				goto out;
 		}
-		spin_unlock(&anon_vma->lock);
-		if (!mapcount)
-			goto out;
 	}
 	if (!search_new_forks++)
 		goto again;
@@ -2422,7 +2553,8 @@ out:
 int try_to_unmap_ksm(struct page *page, enum ttu_flags flags)
 {
 	struct stable_node *stable_node;
-	struct hlist_node *hlist;
+	struct node_vma *node_vma;
+	struct hlist_node *hlist, *rmap_hlist;
 	struct rmap_item *rmap_item;
 	int ret = SWAP_AGAIN;
 	int search_new_forks = 0;
@@ -2434,32 +2566,36 @@ int try_to_unmap_ksm(struct page *page, enum ttu_flags flags)
 	if (!stable_node)
 		return SWAP_FAIL;
 again:
-	hlist_for_each_entry(rmap_item, hlist, &stable_node->hlist, hlist) {
-		struct anon_vma *anon_vma = rmap_item->anon_vma;
-		struct vm_area_struct *vma;
+	hlist_for_each_entry(node_vma, hlist, &stable_node->hlist, hlist) {
+		hlist_for_each_entry(rmap_item, rmap_hlist,
+				     &node_vma->rmap_hlist, hlist) {
+			struct anon_vma *anon_vma = rmap_item->anon_vma;
+			struct vm_area_struct *vma;
 
-		spin_lock(&anon_vma->lock);
-		list_for_each_entry(vma, &anon_vma->head, anon_vma_node) {
-			if (rmap_item->address < vma->vm_start ||
-			    rmap_item->address >= vma->vm_end)
-				continue;
-			/*
-			 * Initially we examine only the vma which covers this
-			 * rmap_item; but later, if there is still work to do,
-			 * we examine covering vmas in other mms: in case they
-			 * were forked from the original since ksmd passed.
-			 */
-			if ((rmap_item->vma == vma) == search_new_forks)
-				continue;
+			spin_lock(&anon_vma->lock);
+			list_for_each_entry(vma, &anon_vma->head,
+					    anon_vma_node) {
+				if (rmap_item->address < vma->vm_start ||
+				    rmap_item->address >= vma->vm_end)
+					continue;
+				/*
+				 * Initially we examine only the vma which covers this
+				 * rmap_item; but later, if there is still work to do,
+				 * we examine covering vmas in other mms: in case they
+				 * were forked from the original since ksmd passed.
+				 */
+				if ((rmap_item->vma == vma) == search_new_forks)
+					continue;
 
-			ret = try_to_unmap_one(page, vma,
-					rmap_item->address, flags);
-			if (ret != SWAP_AGAIN || !page_mapped(page)) {
-				spin_unlock(&anon_vma->lock);
-				goto out;
+				ret = try_to_unmap_one(page, vma,
+						       rmap_item->address, flags);
+				if (ret != SWAP_AGAIN || !page_mapped(page)) {
+					spin_unlock(&anon_vma->lock);
+					goto out;
+				}
 			}
+			spin_unlock(&anon_vma->lock);
 		}
-		spin_unlock(&anon_vma->lock);
 	}
 	if (!search_new_forks++)
 		goto again;
@@ -2472,7 +2608,8 @@ int rmap_walk_ksm(struct page *page, int (*rmap_one)(struct page *,
 		  struct vm_area_struct *, unsigned long, void *), void *arg)
 {
 	struct stable_node *stable_node;
-	struct hlist_node *hlist;
+	struct node_vma *node_vma;
+	struct hlist_node *hlist, *rmap_hlist;
 	struct rmap_item *rmap_item;
 	int ret = SWAP_AGAIN;
 	int search_new_forks = 0;
@@ -2484,31 +2621,34 @@ int rmap_walk_ksm(struct page *page, int (*rmap_one)(struct page *,
 	if (!stable_node)
 		return ret;
 again:
-	hlist_for_each_entry(rmap_item, hlist, &stable_node->hlist, hlist) {
-		struct anon_vma *anon_vma = rmap_item->anon_vma;
-		struct vm_area_struct *vma;
+	hlist_for_each_entry(node_vma, hlist, &stable_node->hlist, hlist) {
+		hlist_for_each_entry(rmap_item, rmap_hlist,
+				     &node_vma->rmap_hlist, hlist) {
+			struct anon_vma *anon_vma = rmap_item->anon_vma;
+			struct vm_area_struct *vma;
 
-		spin_lock(&anon_vma->lock);
-		list_for_each_entry(vma, &anon_vma->head, anon_vma_node) {
-			if (rmap_item->address < vma->vm_start ||
-			    rmap_item->address >= vma->vm_end)
-				continue;
-			/*
-			 * Initially we examine only the vma which covers this
-			 * rmap_item; but later, if there is still work to do,
-			 * we examine covering vmas in other mms: in case they
-			 * were forked from the original since ksmd passed.
-			 */
-			if ((rmap_item->mm == vma->vm_mm) == search_new_forks)
-				continue;
+			spin_lock(&anon_vma->lock);
+			list_for_each_entry(vma, &anon_vma->head, anon_vma_node) {
+				if (rmap_item->address < vma->vm_start ||
+				    rmap_item->address >= vma->vm_end)
+					continue;
+				/*
+				 * Initially we examine only the vma which covers this
+				 * rmap_item; but later, if there is still work to do,
+				 * we examine covering vmas in other mms: in case they
+				 * were forked from the original since ksmd passed.
+				 */
+				if ((rmap_item->mm == vma->vm_mm) == search_new_forks)
+					continue;
 
-			ret = rmap_one(page, vma, rmap_item->address, arg);
-			if (ret != SWAP_AGAIN) {
-				spin_unlock(&anon_vma->lock);
-				goto out;
+				ret = rmap_one(page, vma, rmap_item->address, arg);
+				if (ret != SWAP_AGAIN) {
+					spin_unlock(&anon_vma->lock);
+					goto out;
+				}
 			}
+			spin_unlock(&anon_vma->lock);
 		}
-		spin_unlock(&anon_vma->lock);
 	}
 	if (!search_new_forks++)
 		goto again;
