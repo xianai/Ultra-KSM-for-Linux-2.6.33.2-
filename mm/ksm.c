@@ -619,6 +619,7 @@ void ksm_remove_vma(struct vm_area_struct *vma)
 
 out:
 	vma->rung = NULL;
+	printk(KERN_ERR "KSM: removed task=%s vma=%x\n", vma->vm_mm->owner->comm, (unsigned int)vma);
 	mutex_unlock(&ksm_scan_sem);
 }
 
@@ -704,6 +705,10 @@ static uint32_t SuperFastHash (const char * data, int len) {
 
 	return hash;
 }
+#endif
+
+#ifdef CONFIG_KSM_RANDOM_SAMPLING_HASH
+
 #endif
 
 static void calc_checksum(struct page *page, u32 *checksum)
@@ -1826,10 +1831,10 @@ static struct rmap_item *get_next_rmap_item(struct vm_area_struct *vma,
 	item = get_entry_item(scan_entry);
 
 
-/*
-	printk(KERN_ERR "KSM: scan vma=%x page_index=%lu scan_index=%lu swap_index=%lu\n",
-	       (unsigned int)vma, (addr - vma->vm_start) >> PAGE_SHIFT, scan_index, swap_index);
-*/
+
+	printk(KERN_ERR "KSM: scan task=%s vma=%x page_index=%lu scan_index=%lu swap_index=%lu\n",
+	       vma->vm_mm->owner->comm, (unsigned int)vma, (addr - vma->vm_start) >> PAGE_SHIFT, scan_index, swap_index);
+
 
 	BUG_ON(addr > vma->vm_end || addr < vma->vm_start );
 
@@ -2400,8 +2405,8 @@ static void ksm_vma_enter(struct vm_area_struct *vma)
 		vma->pool_size = pool_size;
 		BUG_ON(!vma->rmap_list_pool);
 		BUG_ON(!vma->pool_counts);
-		printk(KERN_ERR "Added vma=%x from task %s pool_size=%lu\n",
-		       (unsigned long)vma, vma->vm_mm->owner->comm, pool_size);
+		printk(KERN_ERR "KSM: added task=%s vma=%x\n",
+		       vma->vm_mm->owner->comm, (unsigned int)vma);
 	}
 
 
