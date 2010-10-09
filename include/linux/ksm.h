@@ -114,14 +114,6 @@ struct scan_rung {
 	unsigned long scan_turn;
 };
 
-#define CONFIG_KSM_SUPERFASTHASH 1
-
-#ifdef CONFIG_KSM_SHA1
-#define KSM_CHECKSUM_SIZE	5
-#else
-#define KSM_CHECKSUM_SIZE	1
-#endif
-
 /*
  * A few notes about the KSM scanning process,
  * to make it easier to understand the data structures below:
@@ -162,6 +154,11 @@ struct scan_rung {
  *    compare it against the stable tree, and then against the unstable tree.)
  */
 
+struct ksm_checksum {
+	u32 sample_num;
+	u32 val;
+};
+
 /**
  * struct stable_node - node of the stable rbtree
  * @node: rb node of this ksm page in the stable tree
@@ -172,7 +169,7 @@ struct stable_node {
 	struct rb_node node;
 	struct hlist_head hlist;
 	unsigned long kpfn;
-	u32 checksum[KSM_CHECKSUM_SIZE];
+	struct ksm_checksum checksum;
 	struct vm_area_struct *old_vma;
 };
 
@@ -212,7 +209,7 @@ struct rmap_item {
 	/* Which rung scan turn it was last scanned */
 	//unsigned long last_scan;
 	unsigned long entry_index;
-	u32 oldchecksum[KSM_CHECKSUM_SIZE];	/* when unstable */
+	struct ksm_checksum oldchecksum;	/* when unstable */
 	union {
 		struct rb_node node;	/* when node of unstable tree */
 		struct {		/* when listed from stable tree's node_vma */
