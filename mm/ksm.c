@@ -1800,6 +1800,11 @@ next_entry:
 	vma->need_sort = 0;
 }
 
+static inline int vma_fully_scanned(struct vm_area_struct *vma)
+{
+	return (vma->pages_scanned && !(vma->pages_scanned % vma_pages(vma)));
+}
+
 static struct rmap_item *get_next_rmap_item(struct vm_area_struct *vma,
 					    struct page **page)
 {
@@ -1807,13 +1812,16 @@ static struct rmap_item *get_next_rmap_item(struct vm_area_struct *vma,
 	struct rmap_item *item = NULL;
 	struct rmap_list_entry *scan_entry, *swap_entry = NULL;
 
-	scan_index = vma->pages_scanned % vma_pages(vma);
+	scan_index = swap_index = vma->pages_scanned % vma_pages(vma);
 
 	if (pool_entry_boundary(scan_index))
 		try_free_last_pool(vma, scan_index - 1);
 
-	if (vma->pages_scanned && !scan_index && vma->need_sort) {
-		sort_rmap_entry_list(vma);
+	if (vma_fully_scanned(vma)){
+		vma->need_rerand = vma->need_sort;
+		if (vma->need_sort) {
+			sort_rmap_entry_list(vma);
+		}
 	}
 
 	scan_entry = get_rmap_list_entry(vma, scan_index, 1);
@@ -1822,9 +1830,11 @@ static struct rmap_item *get_next_rmap_item(struct vm_area_struct *vma,
 		set_is_addr(scan_entry->addr);
 	}
 
-	rand_range = vma_pages(vma) - scan_index;
-	BUG_ON(!rand_range);
-	swap_index = scan_index + (random32() % rand_range);
+	if (vma->need_rerand) {
+		rand_range = vma_pages(vma) - scan_index;
+		BUG_ON(!rand_range);
+		swap_index = scan_index + (random32() % rand_range);
+	}
 
 	if (swap_index != scan_index) {
 		//// if swap entry and scan entry is within same pool
@@ -2181,11 +2191,6 @@ static void inline cal_ladder_pages_to_scan(unsigned int num)
 		ksm_scan_ladder[i].pages_to_scan = num
 			* ksm_scan_ladder[i].scan_ratio / KSM_SCAN_RATIO_MAX;
 	}
-}
-
-static inline int vma_fully_scanned(struct vm_area_struct *vma)
-{
-	return (vma->pages_scanned && !(vma->pages_scanned % vma_pages(vma)));
 }
 
 /**
@@ -2958,8 +2963,17 @@ static inline int init_random_sampling(void)
 	if (!random_nums)
 		return -ENOMEM;
 
+	for (i = 0; i < RANDOM_NUM_SIZE; i++)
+		random_nums[i] = i;
+
 	for (i = 0; i < RANDOM_NUM_SIZE; i++) {
-		random_nums[i] = random32() % RANDOM_NUM_SIZE;
+		unsigned long rand_range, swap_index, tmp;
+
+		rand_range = RANDOM_NUM_SIZE - i;
+		swap_index = random32() % rand_range;
+		tmp = random_nums[i];
+		random_nums[i] =  random_nums[swap_index];
+		random_nums[swap_index] = tmp;
 	}
 
 	return 0;
