@@ -38,6 +38,7 @@
 #include <crypto/hash.h>
 #include <linux/random.h>
 #include <linux/math64.h>
+#include <linux/gcd.h>
 
 #include <asm/tlbflush.h>
 #include "internal.h"
@@ -666,7 +667,14 @@ static int unmerge_ksm_pages(struct vm_area_struct *vma,
 static u32 *random_nums;
 
 /* the number of unsigned long to be taken */
-static unsigned long current_sample_num = 10;
+static unsigned long current_sample_num = RANDOM_NUM_SIZE >> 1;
+static unsigned long sample_num_delta = 0;
+#define SAMPLE_NUM_DELTA_MAX	4
+static int sample_num_direct = 0; /* 1 for inc, 0 for no action, -1 for dec */
+static unsigned long rshash_pos = 0;
+static unsigned long rshash_neg = 0;
+static unsigned long rshash_cost = 0;
+static unsigned long memcmp_cost = 0;
 
 static u32 random_sample_hash(void *addr, u32 sample_num)
 {
@@ -742,14 +750,24 @@ static uint32_t SuperFastHash (const char * data, int len) {
 }
 
 
-static inline u32 calc_checksum(struct page *page)
+static inline u32 calc_checksum(struct page *page, int cost_accounting)
 {
 	u32 val;
+	unsigned long tmp;
 
 	void *addr = kmap_atomic(page, KM_USER0);
 
 	val = random_sample_hash(addr, current_sample_num);
 	kunmap_atomic(addr, KM_USER0);
+
+	if (cost_accounting) {
+		tmp = rshash_pos;
+		/* it's sucessfully identified by random sampling
+		 * hash, so increase the positive count.
+		 */
+		rshash_pos += rshash_cost * (RANDOM_NUM_SIZE - current_sample_num);
+		BUG_ON(tmp > rshash_pos);
+	}
 
 	return val;
 }
@@ -902,6 +920,7 @@ static int try_to_merge_one_page(struct vm_area_struct *vma, struct page *page,
 	//struct anon_vma *anonvma;
 	pte_t orig_pte = __pte(0);
 	int err = -EFAULT;
+	unsigned long tmp;
 
 	if (page == kpage) {			/* ksm page forked */
 		if (same_page)
@@ -948,10 +967,23 @@ static int try_to_merge_one_page(struct vm_area_struct *vma, struct page *page,
 						    map_sharing);
 			mark_page_accessed(page);
 			err = 0;
-		} else if (pages_identical(page, kpage)) {
-			err = replace_page(vma, page, kpage, orig_pte);
-			//if (!err)
-				//merged = 1;
+		} else {
+			if (pages_identical(page, kpage)) {
+				err = replace_page(vma, page, kpage, orig_pte);
+			} else {
+				if (calc_checksum(page, 0) ==
+				    calc_checksum(kpage, 0)) {
+					/**
+					 * We compare the checksum again, to
+					 * ensure that it is really a hash
+					 * collision instead of being caused
+					 * by page write.
+					 */
+					tmp = rshash_neg;
+					rshash_neg += memcmp_cost;
+					BUG_ON(tmp > rshash_neg);
+				}
+			}
 		}
 	}
 
@@ -1038,7 +1070,7 @@ static inline int checksum_cmp_update(u32 checksum_val,
 {
 	u32 val;
 	if (node_checksum->sample_num != current_sample_num) {
-		node_checksum->val = calc_checksum(tree_page);
+		node_checksum->val = calc_checksum(tree_page, 0);
 		node_checksum->sample_num = current_sample_num;
 	}
 
@@ -1121,9 +1153,10 @@ static struct stable_node *stable_tree_insert(struct page *kpage)
 	struct rb_node *parent = NULL;
 	struct stable_node *stable_node;
 	u32 checksum_val;
+	unsigned long tmp;
 
 	/* now it's write_protected, re-calc checksum */
-	checksum_val = calc_checksum(kpage);
+	checksum_val = calc_checksum(kpage, 1);
 
 	while (*new) {
 		struct page *tree_page;
@@ -1162,10 +1195,16 @@ static struct stable_node *stable_tree_insert(struct page *kpage)
 			ret = memcmp_pages(kpage, tree_page); //write_protect_page
 			put_page(tree_page);
 
-			if (!ret)
-				return NULL;
-			else
-				BUG(); /* TODO: deal with hash collision*/
+			if (ret) {
+				tmp = rshash_neg;
+				rshash_neg += memcmp_cost;
+				BUG_ON(tmp > rshash_neg);
+			}
+
+			/**
+			 * TODO: if ret==0, can these two pages be merged ?
+			 */
+			return NULL;
 		}
 	}
 
@@ -1423,7 +1462,7 @@ static void cmp_and_merge_page(struct page *page, struct rmap_item *rmap_item)
 
 	remove_rmap_item_from_tree(rmap_item);
 
-	checksum_val = calc_checksum(page);
+	checksum_val = calc_checksum(page, 1);
 	/* We first start with searching the page inside the stable tree */
 	kpage = stable_tree_search(page, checksum_val);
 	if (kpage) {
@@ -2118,12 +2157,52 @@ static unsigned long cal_dedup_ratio_clear(struct vm_area_struct *vma)
 	return (dedup_num * KSM_SCAN_RATIO_MAX / pages1);
 }
 
+static inline void inc_current_sample_num(unsigned long delta)
+{
+	current_sample_num += 1 << delta;
+	if (current_sample_num > RANDOM_NUM_SIZE)
+		current_sample_num = RANDOM_NUM_SIZE;
+}
+
+static inline void dec_current_sample_num(unsigned long delta)
+{
+	unsigned long change = 1 << delta;
+
+	if (current_sample_num <= change + 1)
+		current_sample_num = 1;
+	else
+		current_sample_num -= change;
+}
+
+static inline int test_rshash_balance(void)
+{
+	int ret;
+	unsigned long delta = 0, base;
+
+	if (rshash_neg > rshash_pos) {
+		delta = rshash_neg - rshash_pos;
+		base = rshash_pos;
+		ret = 1;
+	} else if (rshash_neg < rshash_pos) {
+		delta = rshash_pos - rshash_neg;
+		base = rshash_neg;
+		ret = -1;
+	} else
+		ret = 0;
+
+	if (ret && delta > (base >> 3))
+		return ret;
+
+	return 0;
+}
+
 static void round_update_ladder(void)
 {
 	int i;
 	struct vm_area_struct *vma;
 	unsigned long dedup_ratio_max = 0, dedup_ratio_mean = 0;
 	unsigned long num = 0, threshold;
+	int balance;
 
 	for (i = 0; i < ksm_vma_table_index_end; i++) {
 		if ((vma = ksm_vma_table[i])) {
@@ -2176,6 +2255,40 @@ out:
 		//ksm_scan_ladder[i].vma_finished = 0;
 	}
 
+	printk(KERN_ERR "KSM: rshash_neg=%lu  rshash_pos=%lu\n", rshash_neg, rshash_pos);
+
+	balance = test_rshash_balance();
+	if (balance > 0) {
+		if (sample_num_direct > 0)
+			sample_num_delta++;
+		else
+			sample_num_delta = 0;
+		sample_num_direct = 1;
+	} else if (balance < 0) {
+		if (sample_num_direct < 0)
+			sample_num_delta++;
+		else
+			sample_num_delta = 0;
+		sample_num_direct = -1;
+	} else {
+		sample_num_delta = 0;
+		sample_num_direct = 0;
+	}
+
+	if (sample_num_delta > SAMPLE_NUM_DELTA_MAX)
+		sample_num_delta = SAMPLE_NUM_DELTA_MAX;
+
+
+	if (balance > 0) {
+		inc_current_sample_num(sample_num_delta);
+		printk(KERN_ERR "KSM: current_sample_num inc to %lu\n", current_sample_num);
+	} else if (balance < 0) {
+		dec_current_sample_num(sample_num_delta);
+		printk(KERN_ERR "KSM: current_sample_num dec to %lu\n", current_sample_num);
+	}
+
+
+	rshash_neg = rshash_pos = 0;
 }
 
 static inline unsigned int ksm_pages_to_scan(unsigned int millionth_ratio)
@@ -2956,6 +3069,61 @@ static void inline init_scan_ladder(void)
 	}
 }
 
+static inline int cal_positive_negative_costs(void)
+{
+	struct page *p1, *p2;
+	unsigned char *addr1, *addr2;
+	unsigned long i, time_start, checksum_cost, gcdval;
+	unsigned long sample_num_stored = current_sample_num;
+	unsigned long loopnum = 0;
+
+	printk(KERN_INFO "KSM: Calculating random sampling hash costs.\n");
+
+	p1 = alloc_page(GFP_KERNEL);
+	if (!p1)
+		return -ENOMEM;
+
+	p2 = alloc_page(GFP_KERNEL);
+	if (!p2)
+		return -ENOMEM;
+
+	addr1 = kmap_atomic(p1, KM_USER0);
+	addr2 = kmap_atomic(p2, KM_USER1);
+	memset(addr1, random32(), PAGE_SIZE);
+	memcpy(addr2, addr1, PAGE_SIZE);
+	/* make sure that the two pages differ in last byte */
+	addr2[PAGE_SIZE-1] = ~addr2[PAGE_SIZE-1];
+	kunmap_atomic(addr2, KM_USER1);
+	kunmap_atomic(addr1, KM_USER0);
+
+	current_sample_num = RANDOM_NUM_SIZE;
+	time_start = jiffies;
+	while (jiffies - time_start < RANDOM_NUM_SIZE / 10) {
+		for (i = 0; i < 100; i++) {
+			calc_checksum(p1, 0);
+		}
+		loopnum += 100;
+	}
+	checksum_cost = 100 * (jiffies - time_start);
+	rshash_cost = checksum_cost / RANDOM_NUM_SIZE;
+	printk(KERN_INFO "KSM: checksum_cost = %lu.\n", rshash_cost);
+	current_sample_num = sample_num_stored;
+
+	time_start = jiffies;
+	for (i = 0; i < loopnum; i++) {
+		pages_identical(p1, p2);
+	}
+	memcmp_cost = 100 * (jiffies - time_start);
+	printk(KERN_INFO "KSM: memcmp_cost = %lu.\n", memcmp_cost);
+	gcdval = gcd(rshash_cost, memcmp_cost);
+	rshash_cost /= gcdval;
+	memcmp_cost /= gcdval;
+
+	__free_page(p1);
+	__free_page(p2);
+	return 0;
+}
+
 static inline int init_random_sampling(void)
 {
 	unsigned long i;
@@ -2976,7 +3144,7 @@ static inline int init_random_sampling(void)
 		random_nums[swap_index] = tmp;
 	}
 
-	return 0;
+	return cal_positive_negative_costs();
 }
 
 static int __init ksm_init(void)
