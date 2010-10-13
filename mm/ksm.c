@@ -669,12 +669,48 @@ static u32 *random_nums;
 /* the number of unsigned long to be taken */
 static unsigned long current_sample_num = RANDOM_NUM_SIZE >> 1;
 static unsigned long sample_num_delta = 0;
-#define SAMPLE_NUM_DELTA_MAX	4
+#define SAMPLE_NUM_DELTA_MAX	5
 static int sample_num_direct = 0; /* 1 for inc, 0 for no action, -1 for dec */
 static unsigned long rshash_pos = 0;
 static unsigned long rshash_neg = 0;
 static unsigned long rshash_cost = 0;
 static unsigned long memcmp_cost = 0;
+static unsigned long rhash_benefit_last = 0;
+static unsigned long rhash_benefit_prev = 0;
+static unsigned long rhash_benefit_max = 0;
+static unsigned long calsum_count = 0;
+
+typedef enum {
+		RSHASH_STILL,
+		RSHASH_TRYUP,
+		RSHASH_TRYDOWN,
+		RSHASH_NEW,
+		RSHASH_PRE_STILL,
+} rshash_state_t;
+
+typedef enum {
+	GO_UP,
+	GO_DOWN,
+	OBSCURE,
+	STILL,
+} rshash_direct_t;
+
+
+static struct {
+	rshash_state_t state;
+	rshash_direct_t pre_direct;
+	u8 below_count;
+	/* Keep a lookup window of size 5, iff above_count/below_count > 3
+	 * in this window we stop trying.
+	 */
+	u8 lookup_window_index;
+	unsigned long stable_benefit;
+	unsigned long turn_point_down;
+	unsigned long turn_benefit_down;
+	unsigned long turn_point_up;
+	unsigned long turn_benefit_up;
+	unsigned long stable_point;
+} rshash_state;
 
 static u32 random_sample_hash(void *addr, u32 sample_num)
 {
@@ -767,6 +803,7 @@ static inline u32 calc_checksum(struct page *page, int cost_accounting)
 		 */
 		rshash_pos += rshash_cost * (RANDOM_NUM_SIZE - current_sample_num);
 		BUG_ON(tmp > rshash_pos);
+		calsum_count++;
 	}
 
 	return val;
@@ -2162,6 +2199,7 @@ static inline void inc_current_sample_num(unsigned long delta)
 	current_sample_num += 1 << delta;
 	if (current_sample_num > RANDOM_NUM_SIZE)
 		current_sample_num = RANDOM_NUM_SIZE;
+	printk(KERN_ERR "KSM: current_sample_num inc to %lu\n", current_sample_num);
 }
 
 static inline void dec_current_sample_num(unsigned long delta)
@@ -2172,28 +2210,204 @@ static inline void dec_current_sample_num(unsigned long delta)
 		current_sample_num = 1;
 	else
 		current_sample_num -= change;
+
+	printk(KERN_ERR "KSM: current_sample_num dec to %lu\n", current_sample_num);
 }
 
-static inline int test_rshash_balance(void)
+static inline void inc_sample_num_delta(void)
 {
-	int ret;
-	unsigned long delta = 0, base;
+	sample_num_delta++;
+	if (sample_num_delta > SAMPLE_NUM_DELTA_MAX)
+		sample_num_delta = SAMPLE_NUM_DELTA_MAX;
+}
 
-	if (rshash_neg > rshash_pos) {
-		delta = rshash_neg - rshash_pos;
-		base = rshash_pos;
-		ret = 1;
-	} else if (rshash_neg < rshash_pos) {
-		delta = rshash_pos - rshash_neg;
-		base = rshash_neg;
-		ret = -1;
-	} else
-		ret = 0;
+static inline unsigned long get_current_neg_ratio(void)
+{
+	if (!rshash_pos)
+		return 100;
 
-	if (ret && delta > (base >> 3))
-		return ret;
+	return (100 * rshash_neg / rshash_pos);
+}
 
-	return 0;
+static inline unsigned long get_current_benefit(void)
+{
+	if (rshash_neg > rshash_pos)
+		return 0;
+
+	return (rshash_pos - rshash_neg) / calsum_count;
+}
+
+
+static inline int judge_rshash_direction(void)
+{
+	unsigned long current_neg_ratio, stable_benefit;
+	unsigned long current_benefit, delta = 0;
+
+	current_neg_ratio = get_current_neg_ratio();
+
+	if (!current_neg_ratio)
+		return GO_DOWN;
+
+	if (current_neg_ratio > 90)
+		return GO_UP;
+
+	current_benefit = get_current_benefit();
+	stable_benefit = rshash_state.stable_benefit;
+
+	if (!stable_benefit)
+		goto out1;
+
+	if (current_benefit > stable_benefit)
+		delta = current_benefit - stable_benefit;
+	else if (current_benefit < stable_benefit)
+		delta = stable_benefit - current_benefit;
+
+	delta = 100 * delta / stable_benefit;
+
+	if (delta > 30) {
+out1:
+		return OBSCURE;
+	}
+
+	return STILL;
+}
+
+static inline void rshash_adjust(void)
+{
+
+	if (!calsum_count)
+		return;
+
+	if (rshash_neg >= rshash_pos &&
+	    rshash_state.state == RSHASH_NEW) {
+		inc_current_sample_num(sample_num_delta);
+		inc_sample_num_delta();
+		return;
+	}
+
+	if (rshash_neg == 0 &&
+	    rshash_state.state == RSHASH_NEW) {
+		dec_current_sample_num(sample_num_delta);
+		inc_sample_num_delta();
+		return;
+	}
+
+
+
+	switch (rshash_state.state) {
+	case RSHASH_STILL:
+		printk(KERN_ERR "KSM: enter state STILL\n");
+		switch (judge_rshash_direction()) {
+		case GO_UP:
+			if (rshash_state.pre_direct == GO_DOWN)
+				sample_num_delta = 0;
+
+			inc_current_sample_num(sample_num_delta);
+			inc_sample_num_delta();
+			rshash_state.stable_benefit = get_current_benefit();
+			rshash_state.pre_direct = GO_UP;
+			break;
+
+		case GO_DOWN:
+			if (rshash_state.pre_direct == GO_UP)
+				sample_num_delta = 0;
+
+			dec_current_sample_num(sample_num_delta);
+			inc_sample_num_delta();
+			rshash_state.stable_benefit = get_current_benefit();
+			rshash_state.pre_direct = GO_DOWN;
+			break;
+
+		case OBSCURE:
+			rshash_state.stable_point = current_sample_num;
+			rshash_state.turn_point_down = current_sample_num;
+			rshash_state.turn_point_up = current_sample_num;
+			rshash_state.turn_benefit_down = get_current_benefit();
+			rshash_state.turn_benefit_up = get_current_benefit();
+			rshash_state.lookup_window_index = 0;
+			rshash_state.state = RSHASH_TRYDOWN;
+			dec_current_sample_num(sample_num_delta);
+			inc_sample_num_delta();
+
+			break;
+
+		case STILL:
+			break;
+		default:
+			BUG();
+		}
+		break;
+
+	case RSHASH_TRYDOWN:
+		printk(KERN_ERR "KSM: enter state TRYDOWN\n");
+		if (rshash_state.lookup_window_index++ % 5 == 0)
+			rshash_state.below_count = 0;
+
+		if (get_current_benefit() < rshash_state.stable_benefit)
+			rshash_state.below_count++;
+		else if (get_current_benefit() > rshash_state.turn_benefit_down) {
+			rshash_state.turn_point_down = current_sample_num;
+			rshash_state.turn_benefit_down = get_current_benefit();
+		}
+
+		if (rshash_state.below_count >= 3 ||
+		    judge_rshash_direction() == GO_UP) {
+			current_sample_num = rshash_state.stable_point;
+			sample_num_delta = 0;
+			inc_current_sample_num(sample_num_delta);
+			inc_sample_num_delta();
+			rshash_state.lookup_window_index = 0;
+			rshash_state.state = RSHASH_TRYUP;
+			sample_num_delta = 0;
+			printk(KERN_ERR "KSM: finished state TRYDOWN with turn_point=%lu benefit=%lu\n",
+			       rshash_state.turn_point_down, rshash_state.turn_benefit_down);
+		} else {
+			dec_current_sample_num(sample_num_delta);
+			inc_sample_num_delta();
+		}
+		break;
+
+	case RSHASH_TRYUP:
+		printk(KERN_ERR "KSM: enter state TRYUP\n");
+		if (rshash_state.lookup_window_index++ % 5 == 0)
+			rshash_state.below_count = 0;
+
+		if (get_current_benefit() < rshash_state.stable_benefit)
+			rshash_state.below_count++;
+		else if (get_current_benefit() > rshash_state.turn_benefit_up) {
+			rshash_state.turn_point_up = current_sample_num;
+			rshash_state.turn_benefit_up = get_current_benefit();
+		}
+
+		if (rshash_state.below_count >= 3 ||
+		    judge_rshash_direction() == GO_DOWN) {
+			current_sample_num = rshash_state.turn_benefit_up >
+			rshash_state.turn_benefit_down ? rshash_state.turn_point_up :
+			rshash_state.turn_point_down;
+			rshash_state.state = RSHASH_PRE_STILL;
+			printk(KERN_ERR "KSM: finished state TRYUP with turn_point=%lu benefit=%lu current_sample_num=%lu\n",
+			       rshash_state.turn_point_up, rshash_state.turn_benefit_up, current_sample_num);
+
+		} else {
+			inc_current_sample_num(sample_num_delta);
+			inc_sample_num_delta();
+		}
+
+		break;
+
+	case RSHASH_NEW:
+		printk(KERN_ERR "KSM: enter state NEW\n");
+	case RSHASH_PRE_STILL:
+		printk(KERN_ERR "KSM: enter state PRE_STILL\n");
+		rshash_state.stable_benefit = get_current_benefit();
+		rshash_state.state = RSHASH_STILL;
+		sample_num_delta = 0;
+		break;
+	default:
+		BUG();
+	}
+
+	rshash_neg = rshash_pos = calsum_count = 0;
 }
 
 static void round_update_ladder(void)
@@ -2202,7 +2416,6 @@ static void round_update_ladder(void)
 	struct vm_area_struct *vma;
 	unsigned long dedup_ratio_max = 0, dedup_ratio_mean = 0;
 	unsigned long num = 0, threshold;
-	int balance;
 
 	for (i = 0; i < ksm_vma_table_index_end; i++) {
 		if ((vma = ksm_vma_table[i])) {
@@ -2255,40 +2468,10 @@ out:
 		//ksm_scan_ladder[i].vma_finished = 0;
 	}
 
-	printk(KERN_ERR "KSM: rshash_neg=%lu  rshash_pos=%lu\n", rshash_neg, rshash_pos);
+	printk(KERN_ERR "KSM: rshash_neg=%lu  rshash_pos=%lu benefit=%lu\n",
+	       rshash_neg, rshash_pos, get_current_benefit());
 
-	balance = test_rshash_balance();
-	if (balance > 0) {
-		if (sample_num_direct > 0)
-			sample_num_delta++;
-		else
-			sample_num_delta = 0;
-		sample_num_direct = 1;
-	} else if (balance < 0) {
-		if (sample_num_direct < 0)
-			sample_num_delta++;
-		else
-			sample_num_delta = 0;
-		sample_num_direct = -1;
-	} else {
-		sample_num_delta = 0;
-		sample_num_direct = 0;
-	}
-
-	if (sample_num_delta > SAMPLE_NUM_DELTA_MAX)
-		sample_num_delta = SAMPLE_NUM_DELTA_MAX;
-
-
-	if (balance > 0) {
-		inc_current_sample_num(sample_num_delta);
-		printk(KERN_ERR "KSM: current_sample_num inc to %lu\n", current_sample_num);
-	} else if (balance < 0) {
-		dec_current_sample_num(sample_num_delta);
-		printk(KERN_ERR "KSM: current_sample_num dec to %lu\n", current_sample_num);
-	}
-
-
-	rshash_neg = rshash_pos = 0;
+	rshash_adjust();
 }
 
 static inline unsigned int ksm_pages_to_scan(unsigned int millionth_ratio)
@@ -3143,6 +3326,10 @@ static inline int init_random_sampling(void)
 		random_nums[i] =  random_nums[swap_index];
 		random_nums[swap_index] = tmp;
 	}
+
+	rshash_state.state = RSHASH_NEW;
+	rshash_state.below_count = 0;
+	rshash_state.lookup_window_index = 0;
 
 	return cal_positive_negative_costs();
 }
