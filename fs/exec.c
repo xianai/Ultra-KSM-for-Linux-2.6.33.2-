@@ -248,7 +248,7 @@ static int __bprm_mm_init(struct linux_binprm *bprm)
 	vma->vm_flags = VM_STACK_FLAGS;
 	vma->vm_page_prot = vm_get_page_prot(vma->vm_flags);
 #ifdef CONFIG_KSM
-	ksm_init_vma(vma);
+	ksm_vma_add_new(vma);
 #endif
 	err = insert_vm_struct(mm, vma);
 	if (err)

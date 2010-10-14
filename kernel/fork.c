@@ -334,7 +334,7 @@ static int dup_mmap(struct mm_struct *mm, struct mm_struct *oldmm)
 		tmp->vm_mm = mm;
 		tmp->vm_next = NULL;
 #ifdef CONFIG_KSM
-		ksm_init_vma(tmp);
+		ksm_vma_add_new(tmp);
 #endif
 		anon_vma_link(tmp);
 		file = tmp->vm_file;

@@ -47,24 +47,7 @@ static inline void set_page_stable_node(struct page *page,
 }
 
 /* must be done before linked to mm */
-static inline void ksm_init_vma(struct vm_area_struct *vma)
-{
-	INIT_LIST_HEAD(&vma->ksm_list);
-	vma->dedup_ratio = 0;
-	vma->ksm_index = -1;
-	vma->pages_scanned = 0;
-	vma->pages_to_scan = 0;
-	vma->last_scanned = 0;
-	vma->need_sort = 0;
-	vma->need_rerand = 1;
-	vma->rung = 0;
-	vma->rmap_list_pool = NULL;
-	vma->pool_counts = NULL;
-	vma->pool_size = 0;
-	//vma->rmap_list = NULL;
-	//vma->rmap_num = 0;
-	vma->vm_flags &= ~VM_MERGEABLE;
-}
+extern inline void ksm_vma_add_new(struct vm_area_struct *vma);
 
 void ksm_remove_vma(struct vm_area_struct *vma);
 
@@ -180,8 +163,8 @@ struct stable_node {
  */
 struct node_vma {
 	union {
-		struct vm_area_struct *vma;
-		unsigned long key;  /* vma is used as key sorted on hlist */
+		struct vma_slot *slot;
+		unsigned long key;  /* slot is used as key sorted on hlist */
 	};
 	struct hlist_node hlist;
 	struct hlist_head rmap_hlist;
@@ -202,7 +185,7 @@ struct node_vma {
  */
 struct rmap_item {
 	struct anon_vma *anon_vma;	/* when stable */
-	struct vm_area_struct *vma;
+	struct vma_slot *slot;
 	unsigned long address;	/* + low bits used for flags below */
 	/* Appendded to (un)stable tree on which scan round */
 	unsigned long append_round;
@@ -228,8 +211,6 @@ struct rmap_list_entry {
 	// lowest bit is used for is_addr tag
 	//unsigned char is_addr;
 } __attribute__((aligned(4))); // 4 aligned to fit in to pages
-
-
 
 //extern struct semaphore ksm_scan_sem;
 #else  /* !CONFIG_KSM */

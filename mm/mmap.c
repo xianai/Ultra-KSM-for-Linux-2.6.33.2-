@@ -1222,7 +1222,7 @@ munmap_back:
 	vma->vm_page_prot = vm_get_page_prot(vm_flags);
 	vma->vm_pgoff = pgoff;
 #ifdef CONFIG_KSM
-		ksm_init_vma(vma);
+		ksm_vma_add_new(vma);
 #endif
 
 	if (file) {
@@ -1912,7 +1912,7 @@ static int __split_vma(struct mm_struct * mm, struct vm_area_struct * vma,
 		new->vm_pgoff += ((addr - vma->vm_start) >> PAGE_SHIFT);
 	}
 #ifdef CONFIG_KSM
-		ksm_init_vma(new);
+		ksm_vma_add_new(new);
 #endif
 
 	pol = mpol_dup(vma_policy(vma));
@@ -2154,7 +2154,7 @@ unsigned long do_brk(unsigned long addr, unsigned long len)
 	vma->vm_flags = flags;
 	vma->vm_page_prot = vm_get_page_prot(flags);
 #ifdef CONFIG_KSM
-		ksm_init_vma(vma);
+		ksm_vma_add_new(vma);
 #endif
 	vma_link(mm, vma, prev, rb_link, rb_parent);
 out:
@@ -2302,7 +2302,7 @@ struct vm_area_struct *copy_vma(struct vm_area_struct **vmap,
 			if (new_vma->vm_ops && new_vma->vm_ops->open)
 				new_vma->vm_ops->open(new_vma);
 #ifdef CONFIG_KSM
-			ksm_init_vma(new_vma);
+			ksm_vma_add_new(new_vma);
 #endif
 			vma_link(mm, new_vma, prev, rb_link, rb_parent);
 		}
@@ -2395,7 +2395,7 @@ int install_special_mapping(struct mm_struct *mm,
 	vma->vm_ops = &special_mapping_vmops;
 	vma->vm_private_data = pages;
 #ifdef CONFIG_KSM
-	ksm_init_vma(vma);
+	ksm_vma_add_new(vma);
 #endif
 	if (unlikely(insert_vm_struct(mm, vma))) {
 		kmem_cache_free(vm_area_cachep, vma);
