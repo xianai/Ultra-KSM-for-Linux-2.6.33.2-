@@ -621,7 +621,7 @@ void ksm_remove_vma(struct vm_area_struct *vma)
 
 out:
 	vma->rung = NULL;
-	//printk(KERN_ERR "KSM: removed task=%s vma=%x\n", vma->vm_mm->owner->comm, (unsigned int)vma);
+	printk(KERN_ERR "KSM: removed task=%s vma=%x\n", vma->vm_mm->owner->comm, (unsigned int)vma);
 	mutex_unlock(&ksm_scan_sem);
 }
 
@@ -2436,7 +2436,7 @@ static void round_update_ladder(void)
 		goto out;
 
 	dedup_ratio_mean /= num;
-	threshold = (dedup_ratio_max + dedup_ratio_mean) / 2;
+	threshold = dedup_ratio_mean;
 
 	for (i = 0; i < ksm_vma_table_index_end; i++) {
 		if ((vma = ksm_vma_table[i])) {
