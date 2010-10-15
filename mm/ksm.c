@@ -112,12 +112,17 @@ static unsigned int ksm_run = KSM_RUN_STOP;
 
 static DECLARE_WAIT_QUEUE_HEAD(ksm_thread_wait);
 static DEFINE_MUTEX(ksm_thread_mutex);
-static DEFINE_MUTEX(ksm_scan_sem);
 
 
 struct list_head vma_slot_new = LIST_HEAD_INIT(vma_slot_new);
 struct list_head vma_slot_del = LIST_HEAD_INIT(vma_slot_del);
 static DEFINE_SPINLOCK(vma_slot_list_lock);
+
+/* In mseconds */
+unsigned long slots_enter_interval = 500;
+
+/* The jiffiy when last ksm_enter_all_slots was run */
+unsigned long slots_enter_last = 0;
 
 struct vma_slot {
 	struct list_head ksm_list;
@@ -627,6 +632,10 @@ inline void ksm_vma_add_new(struct vm_area_struct *vma)
 {
 	struct vma_slot *slot;
 
+	if (!strcmp("best_case", vma->vm_mm->owner->comm)) {
+		printk(KERN_ERR "KSM: add new task=%s vma=%p pages=%lu\n", vma->vm_mm->owner->comm, vma, vma_pages(vma));
+	}
+
 	if (!vma_can_enter_new(vma)) {
 		vma->ksm_vma_slot = NULL;
 		return;
@@ -689,6 +698,8 @@ void ksm_remove_vma(struct vm_area_struct *vma)
 	}
 	spin_unlock(&vma_slot_list_lock);
 	vma->ksm_vma_slot = NULL;
+	if (!strcmp("best_case", vma->vm_mm->owner->comm))
+		printk(KERN_ERR "KSM: removed task=%s vma=%p\n", vma->vm_mm->owner->comm, vma);
 }
 
 
@@ -759,8 +770,8 @@ void ksm_del_vma_slot(struct vma_slot *slot)
 	kfree(slot->pool_counts);
 out:
 	slot->rung = NULL;
+	printk(KERN_ERR "KSM: del slot for vma=%x\n", (unsigned int)vma);
 	free_vma_slot(slot);
-	printk(KERN_ERR "KSM: removed task=%s vma=%x\n", vma->vm_mm->owner->comm, (unsigned int)vma);
 }
 
 /*
@@ -2106,7 +2117,14 @@ static struct rmap_item *get_next_rmap_item(struct vm_area_struct *vma,
 }
 */
 
-static int scan_vma_one_page(struct vma_slot *slot)
+
+/**
+ * Called with mmap_sem locked.
+ *
+ *
+ * @param slot
+ */
+static void scan_vma_one_page(struct vma_slot *slot)
 {
 	struct mm_struct *mm;
 	struct page *page = NULL;
@@ -2117,14 +2135,6 @@ static int scan_vma_one_page(struct vma_slot *slot)
 	BUG_ON(!mm);
 
 
-	if(!down_read_trylock(&mm->mmap_sem)) {
-		printk(KERN_ERR "KSM: Cannot lock vma %s\n", mm->owner->comm);
-		return 1;
-	}
-
-	//BUG_ON(!vma_need_scan(vma));
-	if (ksm_test_exit(mm))
-		goto out;
 /*
 	pages = vma_pages(vma);
 
@@ -2152,9 +2162,6 @@ out1:
 	//rmap_item->last_scan = slot->rung->scan_turn;
 	slot->rung->pages_to_scan--;
 	slot->pages_scanned++;
-out:
-	up_read(&mm->mmap_sem);
-	return 0;
 }
 
 static unsigned long get_vma_random_scan_num(struct vma_slot *slot,
@@ -2605,13 +2612,14 @@ static void ksm_do_scan(void)
 	int i;
 
 	might_sleep();
-	mutex_lock(&ksm_scan_sem);
-	//printk(KERN_ERR "****ksm_do_scan****\n");
+
 	for (i = ksm_scan_ladder_size - 1; i >= 0; i--) {
 		struct scan_rung *rung = &ksm_scan_ladder[i];
 
 		while (rung->pages_to_scan) {
 			int vma_busy = 0, n = 1;
+cleanup:
+			cleanup_vma_slots();
 
 			if (list_empty(&rung->vma_list))
 				break;
@@ -2622,7 +2630,33 @@ static void ksm_do_scan(void)
 
 			BUG_ON(slot->pages != vma_pages(slot->vma));
 
-			vma_busy = scan_vma_one_page(slot);
+			spin_lock(&vma_slot_list_lock);
+			if (!list_empty(&slot->slot_list)) {
+				/* This slot has been added to del list */
+				spin_unlock(&vma_slot_list_lock);
+				goto cleanup;
+			}
+
+			/* slot is in a valid state, it ensure the existance of vma */
+			if(!down_read_trylock(&slot->vma->vm_mm->mmap_sem)) {
+				spin_unlock(&vma_slot_list_lock);
+				printk(KERN_ERR "KSM: Cannot lock vma %s\n", slot->vma->vm_mm->owner->comm);
+				vma_busy = 1;
+				goto busy;
+			}
+			spin_unlock(&vma_slot_list_lock);
+
+			BUG_ON(!vma_can_enter(slot->vma));
+			if (ksm_test_exit(slot->vma->vm_mm)) {
+				up_read(&slot->vma->vm_mm->mmap_sem);
+				vma_busy = 1;
+				goto busy;
+			}
+
+
+			/* Ok, we have take the mmap_sem, ready to scan */
+			scan_vma_one_page(slot);
+			up_read(&slot->vma->vm_mm->mmap_sem);
 			if (!vma_fully_scanned(slot)){
 				rung->fully_scanned = 0;
 			}
@@ -2648,18 +2682,17 @@ static void ksm_do_scan(void)
 					rung->current_scan = next_scan;
 				}
 			}
-			mutex_unlock(&ksm_scan_sem);
-			cond_resched();
+
+busy:
 			if (vma_busy) {
 				msleep(4);
 				n *= 2;
 			} else {
 				n = 1;
+				cond_resched();
 			}
-			mutex_lock(&ksm_scan_sem);
 		}
 	}
-	mutex_unlock(&ksm_scan_sem);
 
 	all_rungs_emtpy = 1;
 	for (i = 0; i < ksm_scan_ladder_size; i++) {
@@ -2678,7 +2711,6 @@ static void ksm_do_scan(void)
 
 	cleanup_vma_slots();
 
-	mutex_lock(&ksm_scan_sem);
 pre_next_round:
 	if (round_finished) {
 		printk(KERN_ERR "KSM: round finished !\n");
@@ -2689,7 +2721,6 @@ pre_next_round:
 		root_unstable_tree = RB_ROOT;
 	}
 	cal_ladder_pages_to_scan(ksm_pages_to_scan(ksm_batch_millionth_ratio));
-	mutex_unlock(&ksm_scan_sem);
 }
 
 static int ksmd_should_run(void)
@@ -2702,36 +2733,20 @@ static inline unsigned int ksm_mips_time_to_jiffies(unsigned int mips_time)
 	return mips_time * 500000  / loops_per_jiffy;
 }
 
-/* It's called with irq disabled, so cannot sleep */
-static void ksm_vma_enter(struct vma_slot *slot)
+/**
+ *
+ *
+ *
+ * @param slot
+ *
+ * @return int , 1 on success, 0 on failure
+ */
+static int ksm_vma_enter(struct vma_slot *slot)
 {
 	struct scan_rung *rung;
 	unsigned long pages_to_scan, pool_size;
 
-/*
-	if (list_empty(&ksm_scan_ladder[0].vma_list))
-		ksm_scan_ladder[0].current_scan = &slot->ksm_list;
-
-	list_add_tail(&slot->ksm_list, &ksm_scan_ladder[0].vma_list);
-	slot->rung = &ksm_scan_ladder[0];
-	slot->pages_to_scan = get_vma_random_scan_num(vma, slot->rung->scan_ratio);
-*/
-
-	/* enter the new rung */
-/*
-	rung = &ksm_scan_ladder[0];
-	while (!(pages_to_scan =
-		get_vma_random_scan_num(vma, rung->scan_ratio))) {
-		rung++;
-		BUG_ON(rung > &ksm_scan_ladder[ksm_scan_ladder_size -1]);
-	}
-	if (list_empty(&rung->vma_list))
-		rung->current_scan = &slot->ksm_list;
-	list_add_tail(&slot->ksm_list, &rung->vma_list);
-	slot->rung = rung;
-	slot->pages_to_scan = pages_to_scan;
-	slot->rung->vma_num++;
-*/
+	while (slot->pages != vma_pages(slot->vma)) spin_lock(&vma_slot_list_lock);
 	rung = &ksm_scan_ladder[0];
 	if ((pages_to_scan = get_vma_random_scan_num(slot, rung->scan_ratio))) {
 		if (list_empty(&rung->vma_list))
@@ -2756,23 +2771,18 @@ static void ksm_vma_enter(struct vma_slot *slot)
 
 		printk(KERN_ERR "KSM: added task=%s vma=%x\n",
 		       slot->vma->vm_mm->owner->comm, (unsigned int)slot->vma);
+		return 1;
 
 	}
 
-
-	/*
-	vma->rmap_list = vmalloc(sizeof(union rmap_list_entry) *
-				 vma_pages(vma));
-	for (i = 0; i < vma_pages(vma); i++)
-	        vma->rmap_list[i].addr = vma->vm_start + i << PAGE_SHIFT;
-	*/
-	//spin_unlock(&ksm_scan_ladder_lock);
+	return 0;
 }
 
 
 static void ksm_enter_all_slots(void)
 {
 	struct vma_slot *slot;
+	int added;
 
 	spin_lock(&vma_slot_list_lock);
 	while (!list_empty(&vma_slot_new)) {
@@ -2788,8 +2798,15 @@ static void ksm_enter_all_slots(void)
 		}
 
 		list_del_init(&slot->slot_list);
+		added = 0;
 		if (vma_can_enter(slot->vma))
-			ksm_vma_enter(slot);
+			added = ksm_vma_enter(slot);
+
+		if (!added) {
+			/* Put back to new list to be del by its creator process */
+			slot->ctime_j = jiffies;
+			list_add_tail(&slot->slot_list, &vma_slot_new);
+		}
 		spin_unlock(&vma_slot_list_lock);
 		cond_resched();
 		spin_lock(&vma_slot_list_lock);
@@ -2804,7 +2821,12 @@ static int ksm_scan_thread(void *nothing)
 	while (!kthread_should_stop()) {
 		mutex_lock(&ksm_thread_mutex);
 		if (ksmd_should_run()) {
-			ksm_enter_all_slots();
+			if (!slots_enter_last ||
+			    time_after(jiffies, slots_enter_last +
+				       msecs_to_jiffies(slots_enter_interval))) {
+				ksm_enter_all_slots();
+				slots_enter_last = jiffies;
+			}
 			ksm_do_scan();
 		}
 		mutex_unlock(&ksm_thread_mutex);

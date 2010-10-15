@@ -526,12 +526,17 @@ void vma_adjust(struct vm_area_struct *vma, unsigned long start,
 
 
 	if (next && !insert) {
+#ifdef CONFIG_KSM
+		ksm_remove_vma(next);
+#endif
+
 		if (end >= next->vm_end) {
 			/*
 			 * vma expands, overlapping all the next, and
 			 * perhaps the one after too (mprotect case 6).
 			 */
-again:			remove_next = 1 + (end > next->vm_end);
+again:
+			remove_next = 1 + (end > next->vm_end);
 			end = next->vm_end;
 			anon_vma = next->anon_vma;
 			importer = vma;
@@ -653,9 +658,6 @@ again:			remove_next = 1 + (end > next->vm_end);
 		}
 		mm->map_count--;
 		mpol_put(vma_policy(next));
-#ifdef CONFIG_KSM
-		ksm_remove_vma(next);
-#endif
 		kmem_cache_free(vm_area_cachep, next);
 		/*
 		 * In mprotect's case 6 (see comments on vma_merge),
@@ -664,9 +666,21 @@ again:			remove_next = 1 + (end > next->vm_end);
 		 */
 		if (remove_next == 2) {
 			next = vma->vm_next;
+#ifdef CONFIG_KSM
+			ksm_remove_vma(next);
+#endif
 			goto again;
 		}
+	} else {
+#ifdef CONFIG_KSM
+		if (next && !insert)
+			ksm_vma_add_new(next);
+#endif
 	}
+
+#ifdef CONFIG_KSM
+	ksm_vma_add_new(vma);
+#endif
 
 	validate_mm(mm);
 }
