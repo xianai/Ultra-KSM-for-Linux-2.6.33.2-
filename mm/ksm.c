@@ -640,7 +640,7 @@ void ksm_del_vma_slot(struct vma_slot *slot)
 	kfree(slot->pool_counts);
 out:
 	slot->rung = NULL;
-	printk(KERN_ERR "KSM: del slot for vma=%x\n", (unsigned int)vma);
+	//printk(KERN_ERR "KSM: del slot for vma=%x\n", (unsigned int)vma);
 	free_vma_slot(slot);
 }
 
@@ -679,7 +679,7 @@ static struct page *get_mergeable_page_lock_mmap(struct rmap_item *item)
 	/* slot is in a valid state, it ensure the existance of vma */
 	if(!down_read_trylock(&slot->vma->vm_mm->mmap_sem)) {
 		spin_unlock(&vma_slot_list_lock);
-		printk(KERN_ERR "KSM: Cannot lock vma %s\n", slot->vma->vm_mm->owner->comm);
+		printk(KERN_ERR "KSM: Cannot lock 2 vma %s\n", slot->vma->vm_mm->owner->comm);
 		return NULL;
 	}
 	spin_unlock(&vma_slot_list_lock);
@@ -742,9 +742,11 @@ inline void ksm_vma_add_new(struct vm_area_struct *vma)
 {
 	struct vma_slot *slot;
 
+/*
 	if (!strcmp("best_case", vma->vm_mm->owner->comm)) {
 		printk(KERN_ERR "KSM: add new task=%s vma=%p pages=%lu\n", vma->vm_mm->owner->comm, vma, vma_pages(vma));
 	}
+*/
 
 	if (!vma_can_enter_new(vma)) {
 		vma->ksm_vma_slot = NULL;
@@ -808,8 +810,10 @@ void ksm_remove_vma(struct vm_area_struct *vma)
 	}
 	spin_unlock(&vma_slot_list_lock);
 	vma->ksm_vma_slot = NULL;
+/*
 	if (!strcmp("best_case", vma->vm_mm->owner->comm))
 		printk(KERN_ERR "KSM: removed task=%s vma=%p\n", vma->vm_mm->owner->comm, vma);
+*/
 }
 
 /*
@@ -1937,7 +1941,7 @@ static void sort_rmap_entry_list(struct vma_slot *slot)
 	unsigned long i, j;
 	struct rmap_list_entry *entry, *swap_entry;
 
-	printk(KERN_ERR "KSM: sort list of vma=%x slot->pages_scanned=%lu\n", (unsigned int)slot->vma, slot->pages_scanned);
+	//printk(KERN_ERR "KSM: sort list of vma=%x slot->pages_scanned=%lu\n", (unsigned int)slot->vma, slot->pages_scanned);
 
 	entry = get_rmap_list_entry(slot, 0, 0);
 	for (i = 0; i < slot->pages; ) {
@@ -2250,8 +2254,10 @@ static inline void vma_rung_enter(struct vma_slot *slot,
 	slot->pages_to_scan = pages_to_scan;
 	//slot->pages_scanned = 0;
 	slot->rung->vma_num++;
+/*
 	printk(KERN_ERR "KSM: %s enter ladder %d vma=%x\n",
 	       slot->vma->vm_mm->owner->comm, (rung - &ksm_scan_ladder[0]), (unsigned int)slot->vma);
+*/
 }
 
 static inline void vma_rung_up(struct vma_slot *slot)
@@ -2331,7 +2337,7 @@ static inline void inc_current_sample_num(unsigned long delta)
 	current_sample_num += 1 << delta;
 	if (current_sample_num > RANDOM_NUM_SIZE)
 		current_sample_num = RANDOM_NUM_SIZE;
-	printk(KERN_ERR "KSM: current_sample_num inc to %lu\n", current_sample_num);
+	//printk(KERN_ERR "KSM: current_sample_num inc to %lu\n", current_sample_num);
 }
 
 static inline void dec_current_sample_num(unsigned long delta)
@@ -2343,7 +2349,7 @@ static inline void dec_current_sample_num(unsigned long delta)
 	else
 		current_sample_num -= change;
 
-	printk(KERN_ERR "KSM: current_sample_num dec to %lu\n", current_sample_num);
+	//printk(KERN_ERR "KSM: current_sample_num dec to %lu\n", current_sample_num);
 }
 
 static inline void inc_sample_num_delta(void)
@@ -2410,8 +2416,10 @@ static inline void rshash_adjust(void)
 	if (!calsum_count)
 		return;
 
+/*
 	printk(KERN_ERR "KSM: rshash_neg=%lu  rshash_pos=%lu benefit=%lu\n",
 	       rshash_neg, rshash_pos, get_current_benefit());
+*/
 
 
 	if (rshash_neg >= rshash_pos &&
@@ -2432,7 +2440,7 @@ static inline void rshash_adjust(void)
 
 	switch (rshash_state.state) {
 	case RSHASH_STILL:
-		printk(KERN_ERR "KSM: enter state STILL\n");
+		//printk(KERN_ERR "KSM: enter state STILL\n");
 		switch (judge_rshash_direction()) {
 		case GO_UP:
 			if (rshash_state.pre_direct == GO_DOWN)
@@ -2475,7 +2483,7 @@ static inline void rshash_adjust(void)
 		break;
 
 	case RSHASH_TRYDOWN:
-		printk(KERN_ERR "KSM: enter state TRYDOWN\n");
+		//printk(KERN_ERR "KSM: enter state TRYDOWN\n");
 		if (rshash_state.lookup_window_index++ % 5 == 0)
 			rshash_state.below_count = 0;
 
@@ -2495,8 +2503,10 @@ static inline void rshash_adjust(void)
 			rshash_state.lookup_window_index = 0;
 			rshash_state.state = RSHASH_TRYUP;
 			sample_num_delta = 0;
+/*
 			printk(KERN_ERR "KSM: finished state TRYDOWN with turn_point=%lu benefit=%lu\n",
 			       rshash_state.turn_point_down, rshash_state.turn_benefit_down);
+*/
 		} else {
 			dec_current_sample_num(sample_num_delta);
 			inc_sample_num_delta();
@@ -2504,7 +2514,7 @@ static inline void rshash_adjust(void)
 		break;
 
 	case RSHASH_TRYUP:
-		printk(KERN_ERR "KSM: enter state TRYUP\n");
+		//printk(KERN_ERR "KSM: enter state TRYUP\n");
 		if (rshash_state.lookup_window_index++ % 5 == 0)
 			rshash_state.below_count = 0;
 
@@ -2521,8 +2531,10 @@ static inline void rshash_adjust(void)
 			rshash_state.turn_benefit_down ? rshash_state.turn_point_up :
 			rshash_state.turn_point_down;
 			rshash_state.state = RSHASH_PRE_STILL;
+/*
 			printk(KERN_ERR "KSM: finished state TRYUP with turn_point=%lu benefit=%lu current_sample_num=%lu\n",
 			       rshash_state.turn_point_up, rshash_state.turn_benefit_up, current_sample_num);
+*/
 
 		} else {
 			inc_current_sample_num(sample_num_delta);
@@ -2532,9 +2544,9 @@ static inline void rshash_adjust(void)
 		break;
 
 	case RSHASH_NEW:
-		printk(KERN_ERR "KSM: enter state NEW\n");
+		//printk(KERN_ERR "KSM: enter state NEW\n");
 	case RSHASH_PRE_STILL:
-		printk(KERN_ERR "KSM: enter state PRE_STILL\n");
+		//printk(KERN_ERR "KSM: enter state PRE_STILL\n");
 		rshash_state.stable_benefit = get_current_benefit();
 		rshash_state.state = RSHASH_STILL;
 		sample_num_delta = 0;
@@ -2664,7 +2676,7 @@ cleanup:
 			/* slot is in a valid state, it ensure the existance of vma */
 			if(!down_read_trylock(&slot->vma->vm_mm->mmap_sem)) {
 				spin_unlock(&vma_slot_list_lock);
-				printk(KERN_ERR "KSM: Cannot lock vma %s\n", slot->vma->vm_mm->owner->comm);
+				//printk(KERN_ERR "KSM: Cannot lock vma %s\n", slot->vma->vm_mm->owner->comm);
 				vma_busy = 1;
 				goto busy;
 			}
@@ -2698,7 +2710,7 @@ cleanup:
 					BUG_ON(!rung->scan_turn);
 					rung->current_scan = rung->vma_list.next;
 					if (rung->fully_scanned) {
-						printk(KERN_ERR "KSM: solo round finished !\n");
+						//printk(KERN_ERR "KSM: solo round finished !\n");
 						goto pre_next_round;
 					} else
 						rung->fully_scanned = 1;
@@ -2793,8 +2805,10 @@ static int ksm_vma_enter(struct vma_slot *slot)
 		BUG_ON(!slot->rmap_list_pool);
 		BUG_ON(!slot->pool_counts);
 
+/*
 		printk(KERN_ERR "KSM: added task=%s vma=%x\n",
 		       slot->vma->vm_mm->owner->comm, (unsigned int)slot->vma);
+*/
 		return 1;
 
 	}
@@ -2816,7 +2830,7 @@ static void ksm_enter_all_slots(void)
 			 * slots are sorted by ctime_j, if one found to be too
 			 * young, just stop scanning the rest ones.
 			 */
-			printk(KERN_ERR "KSM: skip too young vma=%x\n", slot->vma);
+			//printk(KERN_ERR "KSM: skip too young vma=%x\n", slot->vma);
 			spin_unlock(&vma_slot_list_lock);
 			return;
 		}
@@ -3345,7 +3359,7 @@ static inline int cal_positive_negative_costs(void)
 	unsigned long sample_num_stored = current_sample_num;
 	unsigned long loopnum = 0;
 
-	printk(KERN_INFO "KSM: Calculating random sampling hash costs.\n");
+	//printk(KERN_INFO "KSM: Calculating random sampling hash costs.\n");
 
 	p1 = alloc_page(GFP_KERNEL);
 	if (!p1)
@@ -3374,7 +3388,7 @@ static inline int cal_positive_negative_costs(void)
 	}
 	checksum_cost = 100 * (jiffies - time_start);
 	rshash_cost = checksum_cost / RANDOM_NUM_SIZE;
-	printk(KERN_INFO "KSM: checksum_cost = %lu.\n", rshash_cost);
+	//printk(KERN_INFO "KSM: checksum_cost = %lu.\n", rshash_cost);
 	current_sample_num = sample_num_stored;
 
 	time_start = jiffies;
@@ -3382,7 +3396,7 @@ static inline int cal_positive_negative_costs(void)
 		pages_identical(p1, p2);
 	}
 	memcmp_cost = 100 * (jiffies - time_start);
-	printk(KERN_INFO "KSM: memcmp_cost = %lu.\n", memcmp_cost);
+	//printk(KERN_INFO "KSM: memcmp_cost = %lu.\n", memcmp_cost);
 	gcdval = gcd(rshash_cost, memcmp_cost);
 	rshash_cost /= gcdval;
 	memcmp_cost /= gcdval;
