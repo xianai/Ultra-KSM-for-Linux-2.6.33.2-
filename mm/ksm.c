@@ -403,34 +403,22 @@ out:
 	return;
 }
 
-static struct page *get_mergeable_page_lock_mmap(struct rmap_item *item)
+/* can be refactored & beautified */
+static void ksm_intertab_clear(struct vma_slot *slot)
 {
-	struct mm_struct *mm = item->slot->vma->vm_mm;
-	unsigned long addr = item->address;
-	struct vm_area_struct *vma = item->slot->vma;
-	struct page *page;
+	int i;
+	unsigned index;
 
-	if (!down_read_trylock(&mm->mmap_sem))
-		return NULL;
-
-	if (ksm_test_exit(mm))
-		goto failout;
-
-	page = follow_page(vma, addr, FOLL_GET);
-	if (!page)
-		goto failout;
-	if (PageAnon(page)) {
-		flush_anon_page(vma, page, addr);
-		flush_dcache_page(page);
-	} else {
-		put_page(page);
-		goto failout;
+	for (i = 0; i <= slot->ksm_index; i++) {
+		index = intertab_vma_offset(slot->ksm_index, i);
+		ksm_inter_vma_table[index] = 0; /* Cleared data for this round */
 	}
-	return page;
 
-failout:
-	up_read(&mm->mmap_sem);
-	return NULL;
+	for (i = slot->ksm_index + 1; i < ksm_vma_table_index_end; i++) {
+		index = intertab_vma_offset(slot->ksm_index, i);
+		ksm_inter_vma_table[index] = 0;
+	}
+
 }
 
 static void remove_node_from_stable_tree(struct stable_node *stable_node)
@@ -469,6 +457,7 @@ static void remove_node_from_stable_tree(struct stable_node *stable_node)
 	rb_erase(&stable_node->node, &root_stable_tree);
 	free_stable_node(stable_node);
 }
+
 
 /*
  * get_ksm_page: checks if the page indicated by the stable node
@@ -523,8 +512,6 @@ stale:
 	remove_node_from_stable_tree(stable_node);
 	return NULL;
 }
-
-
 
 /*
  * Removing rmap_item from stable or unstable tree.
@@ -585,23 +572,146 @@ out:
 	return;
 }
 
-/* can be refactored & beautified */
-static void ksm_intertab_clear(struct vma_slot *slot)
+
+/* It must be done AFTER vma is unlinked from its mm */
+void ksm_del_vma_slot(struct vma_slot *slot)
 {
-	int i;
-	unsigned index;
+	int i, j;
+	struct rmap_list_entry *entry;
+	struct vm_area_struct *vma = slot->vma;
 
-	for (i = 0; i <= slot->ksm_index; i++) {
-		index = intertab_vma_offset(slot->ksm_index, i);
-		ksm_inter_vma_table[index] = 0; /* Cleared data for this round */
+	/* mutex lock contention maybe intensive, other idea ? */
+	BUG_ON(list_empty(&slot->ksm_list) || !slot->rung);
+
+	if (slot->rung->current_scan == &slot->ksm_list)
+		slot->rung->current_scan = slot->rung->current_scan->next;
+
+	list_del_init(&slot->ksm_list);
+	slot->rung->vma_num--;
+
+	if (slot->rung->current_scan == &slot->rung->vma_list) {
+		/* This rung finishes a round */
+		slot->rung->round_finished = 1;
+		slot->rung->current_scan = slot->rung->vma_list.next;
 	}
 
-	for (i = slot->ksm_index + 1; i < ksm_vma_table_index_end; i++) {
-		index = intertab_vma_offset(slot->ksm_index, i);
-		ksm_inter_vma_table[index] = 0;
+	for (i = 0; i < ksm_vma_table_index_end; i++) {
+		if ((slot == ksm_vma_table[i])) {
+			//cal_dedup_ratio_clear(vma);
+			ksm_intertab_clear(slot);
+			ksm_vma_table_num--;
+			ksm_vma_table[i] = NULL;
+			if (i == ksm_vma_table_index_end - 1)
+				ksm_vma_table_index_end--;
+			break;
+		}
 	}
 
+	/* vma may be already deleted */
+	//BUG_ON(slot->pool_size != vma_pool_size(vma));
+
+	if (!slot->rmap_list_pool)
+		goto out;
+
+	for (i = 0; i < slot->pool_size; i++) {
+		void *addr;
+
+		if (!slot->rmap_list_pool[i])
+			continue;
+
+		addr = kmap(slot->rmap_list_pool[i]);
+		BUG_ON(!addr);
+		for (j = 0; j < PAGE_SIZE / sizeof(*entry); j++) {
+			entry = (struct rmap_list_entry *)addr + j;
+			if (is_addr(entry->addr))
+				continue;
+			if (!entry->item)
+				continue;
+
+			remove_rmap_item_from_tree(entry->item);
+			free_rmap_item(entry->item);
+			slot->pool_counts[i]--;
+		}
+		BUG_ON(slot->pool_counts[i]);
+		kunmap(slot->rmap_list_pool[i]);
+		__free_page(slot->rmap_list_pool[i]);
+	}
+	kfree(slot->rmap_list_pool);
+	kfree(slot->pool_counts);
+out:
+	slot->rung = NULL;
+	printk(KERN_ERR "KSM: del slot for vma=%x\n", (unsigned int)vma);
+	free_vma_slot(slot);
 }
+
+
+static void inline cleanup_vma_slots(void)
+{
+	struct vma_slot *slot;
+
+	spin_lock(&vma_slot_list_lock);
+	while (!list_empty(&vma_slot_del)) {
+		slot = list_entry(vma_slot_del.next, struct vma_slot, slot_list);
+		list_del(&slot->slot_list);
+		spin_unlock(&vma_slot_list_lock);
+		ksm_del_vma_slot(slot);
+		spin_lock(&vma_slot_list_lock);
+	}
+	spin_unlock(&vma_slot_list_lock);
+}
+
+static struct page *get_mergeable_page_lock_mmap(struct rmap_item *item)
+{
+	struct mm_struct *mm;
+	unsigned long addr = item->address;
+	struct vm_area_struct *vma;
+	struct page *page;
+	struct vma_slot *slot = item->slot;
+
+	spin_lock(&vma_slot_list_lock);
+	if (!list_empty(&slot->slot_list)) {
+		/* This slot has been added to del list */
+		spin_unlock(&vma_slot_list_lock);
+		cleanup_vma_slots();
+		return NULL;
+	}
+
+	/* slot is in a valid state, it ensure the existance of vma */
+	if(!down_read_trylock(&slot->vma->vm_mm->mmap_sem)) {
+		spin_unlock(&vma_slot_list_lock);
+		printk(KERN_ERR "KSM: Cannot lock vma %s\n", slot->vma->vm_mm->owner->comm);
+		return NULL;
+	}
+	spin_unlock(&vma_slot_list_lock);
+
+	mm = slot->vma->vm_mm;
+	vma = slot->vma;
+
+	if (ksm_test_exit(mm))
+		goto failout;
+
+	page = follow_page(vma, addr, FOLL_GET);
+	if (!page)
+		goto failout;
+	if (PageAnon(page)) {
+		flush_anon_page(vma, page, addr);
+		flush_dcache_page(page);
+	} else {
+		put_page(page);
+		goto failout;
+	}
+	return page;
+
+failout:
+	up_read(&mm->mmap_sem);
+	return NULL;
+}
+
+
+
+
+
+
 
 static inline int vma_can_enter_new(struct vm_area_struct *vma)
 {
@@ -700,78 +810,6 @@ void ksm_remove_vma(struct vm_area_struct *vma)
 	vma->ksm_vma_slot = NULL;
 	if (!strcmp("best_case", vma->vm_mm->owner->comm))
 		printk(KERN_ERR "KSM: removed task=%s vma=%p\n", vma->vm_mm->owner->comm, vma);
-}
-
-
-
-/* It must be done AFTER vma is unlinked from its mm */
-void ksm_del_vma_slot(struct vma_slot *slot)
-{
-	int i, j;
-	struct rmap_list_entry *entry;
-	struct vm_area_struct *vma = slot->vma;
-
-	/* mutex lock contention maybe intensive, other idea ? */
-	BUG_ON(list_empty(&slot->ksm_list) || !slot->rung);
-
-	if (slot->rung->current_scan == &slot->ksm_list)
-		slot->rung->current_scan = slot->rung->current_scan->next;
-
-	list_del_init(&slot->ksm_list);
-	slot->rung->vma_num--;
-
-	if (slot->rung->current_scan == &slot->rung->vma_list) {
-		/* This rung finishes a round */
-		slot->rung->round_finished = 1;
-		slot->rung->current_scan = slot->rung->vma_list.next;
-	}
-
-	for (i = 0; i < ksm_vma_table_index_end; i++) {
-		if ((slot == ksm_vma_table[i])) {
-			//cal_dedup_ratio_clear(vma);
-			ksm_intertab_clear(slot);
-			ksm_vma_table_num--;
-			ksm_vma_table[i] = NULL;
-			if (i == ksm_vma_table_index_end - 1)
-				ksm_vma_table_index_end--;
-			break;
-		}
-	}
-
-	BUG_ON(slot->pool_size != vma_pool_size(vma));
-
-	if (!slot->rmap_list_pool)
-		goto out;
-
-	for (i = 0; i < slot->pool_size; i++) {
-		void *addr;
-
-		if (!slot->rmap_list_pool[i])
-			continue;
-
-		addr = kmap(slot->rmap_list_pool[i]);
-		BUG_ON(!addr);
-		for (j = 0; j < PAGE_SIZE / sizeof(*entry); j++) {
-			entry = (struct rmap_list_entry *)addr + j;
-			if (is_addr(entry->addr))
-				continue;
-			if (!entry->item)
-				continue;
-
-			remove_rmap_item_from_tree(entry->item);
-			free_rmap_item(entry->item);
-			slot->pool_counts[i]--;
-		}
-		BUG_ON(slot->pool_counts[i]);
-		kunmap(slot->rmap_list_pool[i]);
-		__free_page(slot->rmap_list_pool[i]);
-	}
-	kfree(slot->rmap_list_pool);
-	kfree(slot->pool_counts);
-out:
-	slot->rung = NULL;
-	printk(KERN_ERR "KSM: del slot for vma=%x\n", (unsigned int)vma);
-	free_vma_slot(slot);
 }
 
 /*
@@ -2585,20 +2623,6 @@ static void inline cal_ladder_pages_to_scan(unsigned int num)
 	}
 }
 
-static void inline cleanup_vma_slots(void)
-{
-	struct vma_slot *slot;
-
-	spin_lock(&vma_slot_list_lock);
-	while (!list_empty(&vma_slot_del)) {
-		slot = list_entry(vma_slot_del.next, struct vma_slot, slot_list);
-		list_del(&slot->slot_list);
-		spin_unlock(&vma_slot_list_lock);
-		ksm_del_vma_slot(slot);
-		spin_lock(&vma_slot_list_lock);
-	}
-	spin_unlock(&vma_slot_list_lock);
-}
 
 /**
  * ksm_do_scan  - the ksm scanner main worker function.
