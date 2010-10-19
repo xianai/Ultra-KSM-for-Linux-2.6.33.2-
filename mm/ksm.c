@@ -1892,8 +1892,8 @@ static inline void free_entry_item(struct rmap_list_entry *entry)
 		set_is_addr(entry->addr);
 		index = item->entry_index;
 		remove_rmap_item_from_tree(item);
-		free_rmap_item(item);
 		dec_rmap_list_pool_count(item->slot, index);
+		free_rmap_item(item);
 	}
 }
 
@@ -2664,7 +2664,6 @@ cleanup:
 					 struct vma_slot, ksm_list);
 
 
-			BUG_ON(slot->pages != vma_pages(slot->vma));
 
 			spin_lock(&vma_slot_list_lock);
 			if (!list_empty(&slot->slot_list)) {
@@ -2672,6 +2671,8 @@ cleanup:
 				spin_unlock(&vma_slot_list_lock);
 				goto cleanup;
 			}
+			
+			BUG_ON(slot->pages != vma_pages(slot->vma));
 
 			/* slot is in a valid state, it ensure the existance of vma */
 			if(!down_read_trylock(&slot->vma->vm_mm->mmap_sem)) {
