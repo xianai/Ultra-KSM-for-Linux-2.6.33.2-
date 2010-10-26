@@ -89,7 +89,7 @@ static unsigned int ksm_thread_sleep_mips_time = 21;
 #define KSM_SCAN_RATIO_MAX	1000000
 
 /* minimum scan ratio for a vma, in unit of millionth */
-static unsigned int ksm_min_scan_ratio = 10000;
+static unsigned int ksm_min_scan_ratio = 50000;
 
 /* Inter vma duplication number table page pointer array, initialized at startup */
 #define KSM_DUP_VMA_MAX		2048
@@ -108,6 +108,8 @@ static unsigned int ksm_scan_ratio_delta = 5;
 /* Each rung of this ladder is a list of VMAs having a same scan ratio */
 static struct scan_rung *ksm_scan_ladder;
 static unsigned int ksm_scan_ladder_size;
+
+static unsigned long ksm_vma_slot_num = 0;
 
 
 #define KSM_RUN_STOP	0
@@ -648,6 +650,8 @@ out:
 	slot->rung = NULL;
 	//printk(KERN_ERR "KSM: del slot for vma=%x\n", (unsigned int)vma);
 	free_vma_slot(slot);
+	BUG_ON(!ksm_vma_slot_num);
+	ksm_vma_slot_num--;
 }
 
 
@@ -2304,8 +2308,10 @@ static inline void vma_rung_enter(struct vma_slot *slot,
 	//slot->pages_scanned = 0;
 	slot->rung->vma_num++;
 
+
 	printk(KERN_ERR "KSM: %s enter ladder %d vma=%x dedup=%lu\n",
 	       slot->vma->vm_mm->owner->comm, (rung - &ksm_scan_ladder[0]), (unsigned int)slot->vma, slot->dedup_ratio);
+
 	BUG_ON(rung->current_scan == &rung->vma_list && !list_empty(&rung->vma_list));
 
 }
@@ -2630,7 +2636,7 @@ static void round_update_ladder(void)
 	if (!num)
 		goto out;
 
-	dedup_ratio_mean /= num;
+	dedup_ratio_mean /= ksm_vma_slot_num;
 	threshold = dedup_ratio_mean;
 
 	for (i = 0; i < ksm_vma_table_index_end; i++) {
@@ -2746,10 +2752,10 @@ busy:
 				if (iter->vma->vm_mm != busy_mm) {
 					rung->current_scan = &iter->ksm_list;
 					BUG_ON(rung->current_scan == &rung->vma_list && !list_empty(&rung->vma_list));
-					printk(KERN_ERR "KSM: skip to next mm !\n");
+					//printk(KERN_ERR "KSM: skip to next mm !\n");
 					goto rescan;
 				} else {/* This is the only vma on this rung */
-					printk(KERN_ERR "KSM: skip to next rung !\n");
+					//printk(KERN_ERR "KSM: skip to next rung !\n");
 					break;
 				}
 			}
@@ -2818,7 +2824,7 @@ busy:
 
 pre_next_round:
 	if (round_finished) {
-		printk(KERN_ERR "KSM: round finished !\n");
+		//printk(KERN_ERR "KSM: round finished !\n");
 		round_update_ladder();
 
 		/* sync with ksm_remove_vma for rb_erase */
@@ -2879,6 +2885,9 @@ static int ksm_vma_enter(struct vma_slot *slot)
 		       slot->vma->vm_mm->owner->comm, (unsigned int)slot->vma);
 */
 		BUG_ON(rung->current_scan == &rung->vma_list && !list_empty(&rung->vma_list));
+
+		ksm_vma_slot_num++;
+		BUG_ON(!ksm_vma_slot_num);
 		return 1;
 
 	}
