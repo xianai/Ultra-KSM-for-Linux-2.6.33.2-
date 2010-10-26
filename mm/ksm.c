@@ -150,6 +150,7 @@ struct vma_slot {
 	struct mm_struct *mm;
 	unsigned long ctime_j;
 	unsigned long pages;
+	unsigned long slot_scanned;
 };
 
 
@@ -2254,6 +2255,7 @@ out1:
 	//rmap_item->last_scan = slot->rung->scan_turn;
 	slot->rung->pages_to_scan--;
 	slot->pages_scanned++;
+	slot->slot_scanned = 1;
 }
 
 static unsigned long get_vma_random_scan_num(struct vma_slot *slot,
@@ -2302,7 +2304,7 @@ static inline void vma_rung_enter(struct vma_slot *slot,
 	}
 	if (list_empty(&rung->vma_list))
 		rung->current_scan = &slot->ksm_list;
-	list_add_tail(&slot->ksm_list, &rung->vma_list);
+	list_add(&slot->ksm_list, &rung->vma_list);
 	slot->rung = rung;
 	slot->pages_to_scan = pages_to_scan;
 	//slot->pages_scanned = 0;
@@ -2652,8 +2654,26 @@ static void round_update_ladder(void)
 			ksm_vma_table_num--;
 			ksm_vma_table[i] = NULL;
 			slot->ksm_index = -1;
+			slot->slot_scanned = 0;
+			slot->dedup_ratio = 0;
 		}
 	}
+
+	for (i = 0; i < ksm_scan_ladder_size; i++) {
+		list_for_each_entry(slot, &ksm_scan_ladder[i].vma_list,
+				    ksm_list) {
+			/**
+			 * The slots were scanned but not in inter_tab, their dedup must
+			 * be 0.
+			 */
+			if (slot->slot_scanned) {
+				BUG_ON(slot->dedup_ratio != 0);
+				slot->dedup_ratio = 0;
+				vma_rung_down(slot);
+			}
+		}
+	}
+
 
 	BUG_ON(ksm_vma_table_num != 0);
 	ksm_vma_table_index_end = 0;
@@ -2668,6 +2688,7 @@ out:
 				    ksm_list) {
 			//slot->pages_scanned = 0;
 			slot->last_scanned = slot->pages_scanned;
+			slot->slot_scanned = 0;
 			BUG_ON(slot->ksm_index != -1);
         	}
 
@@ -2770,10 +2791,11 @@ busy:
 
 
 			/* Ok, we have take the mmap_sem, ready to scan */
-			scan_vma_one_page(slot);
+			if (!vma_fully_scanned(slot))
+				scan_vma_one_page(slot);
 			up_read(&slot->vma->vm_mm->mmap_sem);
 
-			if (!vma_fully_scanned(slot)){
+			if (!vma_fully_scanned(slot)) {
 				rung->fully_scanned = 0;
 			}
 
@@ -2791,7 +2813,7 @@ busy:
 					rung->current_scan = rung->vma_list.next;
 					BUG_ON(rung->current_scan == &rung->vma_list && !list_empty(&rung->vma_list));
 					if (rung->fully_scanned) {
-						//printk(KERN_ERR "KSM: solo round finished !\n");
+						printk(KERN_ERR "KSM: solo round finished !\n");
 						goto pre_next_round;
 					} else
 						rung->fully_scanned = 1;
@@ -2824,7 +2846,7 @@ busy:
 
 pre_next_round:
 	if (round_finished) {
-		//printk(KERN_ERR "KSM: round finished !\n");
+		printk(KERN_ERR "KSM: round finished !\n");
 		round_update_ladder();
 
 		/* sync with ksm_remove_vma for rb_erase */
@@ -2865,7 +2887,7 @@ static int ksm_vma_enter(struct vma_slot *slot)
 		if (!list_empty(&slot->ksm_list)) {
 			printk(KERN_ERR "BUG:KSM slot->ksm_list should be emtpy process:%s\n", slot->vma->vm_mm->owner->comm);
 		}
-		list_add_tail(&slot->ksm_list, &rung->vma_list);
+		list_add(&slot->ksm_list, &rung->vma_list);
 		slot->rung = rung;
 		slot->pages_to_scan = pages_to_scan;
 		slot->rung->vma_num++;
@@ -2880,10 +2902,10 @@ static int ksm_vma_enter(struct vma_slot *slot)
 		BUG_ON(!slot->rmap_list_pool);
 		BUG_ON(!slot->pool_counts);
 
-/*
+
 		printk(KERN_ERR "KSM: added task=%s vma=%x\n",
 		       slot->vma->vm_mm->owner->comm, (unsigned int)slot->vma);
-*/
+
 		BUG_ON(rung->current_scan == &rung->vma_list && !list_empty(&rung->vma_list));
 
 		ksm_vma_slot_num++;
