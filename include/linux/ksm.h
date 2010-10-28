@@ -91,7 +91,7 @@ struct scan_rung {
 	struct list_head *current_scan;
 	unsigned int pages_to_scan;
 	unsigned char round_finished; /* rung is ready for the next round */
-	unsigned char fully_scanned;
+	unsigned char fully_scanned_slots;
 	unsigned long scan_ratio;
 	unsigned long vma_num;
 	//unsigned long vma_finished;
