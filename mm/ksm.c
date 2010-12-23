@@ -43,6 +43,71 @@
 #include <asm/tlbflush.h>
 #include "internal.h"
 
+#define CONFIG_USE_KSM_MEMCMPX86 1
+
+
+
+
+
+#ifdef CONFIG_USE_KSM_MEMCMPX86
+#undef memcmp
+#define memcmp memcmpx86
+/*
+int memcmpx86b (__const void *__s1, __const void *__s2, size_t __n)
+{
+   register int __res;
+  __asm__ __volatile__
+    ("cld\n\t"
+     "testl %3,%3\n\t"
+     "repe; cmpsb\n\t"
+     "je        1f\n\t"
+     "sbbl      %0,%0\n\t"
+     "orl       $1,%0\n"
+     "1:"
+     : "=&a" (__res), "+&S" (__s1), "+&D" (__s2), "+&c" (__n)
+     : "0" (0)
+     : "cc");
+  return __res;
+}
+*/
+
+
+int memcmpx86 (void *__s1, void *__s2, size_t __n)
+{
+
+  //printf("si=%p\n", __s1);
+   size_t num = __n / sizeof(int);
+   register int __res;
+  __asm__ __volatile__
+    ("cld\n\t"
+     "testl %3,%3\n\t"
+     "repe; cmpsd\n\t"
+     "je        1f\n\t"
+     "sbbl      %0,%0\n\t"
+     "orl       $1,%0\n"
+     "1:"
+     : "=&a" (__res), "+&S" (__s1), "+&D" (__s2), "+&c" (num)
+     : "0" (0)
+     : "cc");
+
+  //printf("si=%p\n", __s1);
+  return __res;
+}
+
+#endif
+
+
+
+
+
+
+
+
+
+
+
+
+
 #define SEQNR_MASK	0x0ff	/* low bits of unstable tree seqnr */
 #define UNSTABLE_FLAG	0x100	/* is a node of the unstable tree */
 #define STABLE_FLAG	0x200	/* is listed from the stable tree */
@@ -80,10 +145,10 @@ static unsigned long ksm_rmap_items;
 static unsigned long ksm_stable_nodes;
 
 /* Number of pages ksmd should scan in one batch, in ratio of millionth */
-static unsigned int ksm_scan_millionth_ratio = 234;
+static unsigned long ksm_scan_batch_pages = 100;
 
 /* Milliseconds ksmd should sleep between batches */
-static unsigned int ksm_thread_sleep_mips_time = 21;
+static unsigned int ksm_thread_sleep_millisecs = 20;
 
 
 #define KSM_SCAN_RATIO_MAX	1000000
@@ -957,31 +1022,23 @@ static struct {
 
 static u32 random_sample_hash(void *addr, u32 sample_num)
 {
-	u32 hash = sample_num, tmp;
-	unsigned char *data;
-	unsigned long index;
+        u32 hash = 0, tmp;
+        unsigned char *data;
+        u32 index, pos;
+        u32 *key = (u32*)addr;
 
-	BUG_ON(!sample_num || sample_num > RANDOM_NUM_SIZE || !addr);
 
-	/* Main loop */
-	for (index = 0; index < sample_num; index++) {
-		data = &((unsigned char*)addr)[random_nums[index] * sizeof(unsigned long)];
-		hash += get16bits (data);
-		tmp  = (get16bits (data+2) << 11) ^ hash;
-		hash = (hash << 16) ^ tmp;
-		hash += hash >> 11;
-	}
+        /* Main loop */
+        for (index = 0; index < sample_num; index++) {
+                pos = random_nums[index];
+                hash += key[pos];
+                hash += (hash << 19);
+                hash ^= (hash >> 16);
+        }
 
-	/* Force "avalanching" of final 127 bits */
-	hash ^= hash << 3;
-	hash += hash >> 5;
-	hash ^= hash << 4;
-	hash += hash >> 17;
-	hash ^= hash << 25;
-	hash += hash >> 6;
-
-	return hash;
+        return hash;
 }
+
 
 static inline u32 calc_checksum(struct page *page, int cost_accounting)
 {
@@ -1302,12 +1359,31 @@ static struct page *try_to_merge_two_pages(struct rmap_item *rmap_item,
 
 static inline int checksum_cmp_update(u32 checksum_val,
 				      struct ksm_checksum *node_checksum,
-				      struct page *tree_page)
+				      struct stable_node *stable_node,
+				      int *earlyexit)
 {
+	struct page *tree_page;
 	u32 val;
+
 	if (node_checksum->sample_num != current_sample_num) {
+		/* all pages in unstable tree are built in the same scan round,
+		   so must have same sample_num */
+		if (!stable_node) {
+			printk(KERN_ERR "KSM: BUG current_sample_num is %lu, while %lu is node_checksum->sample_num\n",
+			       current_sample_num, node_checksum->sample_num);
+			BUG();
+		}
+
+		tree_page = get_ksm_page(stable_node);
+		if (!tree_page) {
+			*earlyexit = 1;
+			return 0;
+		}
+
 		node_checksum->val = calc_checksum(tree_page, 0);
 		node_checksum->sample_num = current_sample_num;
+		put_page(tree_page);
+		*earlyexit = 2;
 	}
 
 	val = node_checksum->val;
@@ -1350,27 +1426,26 @@ static struct page *stable_tree_search(struct page *page, u32 checksum_val)
 
 	while (node) {
 		struct page *tree_page;
-		int cmp;
+		int cmp, early_exit = 0;
 
 		cond_resched();
 		stable_node = rb_entry(node, struct stable_node, node);
 
-		tree_page = get_ksm_page(stable_node);
-		if (!tree_page)
+		cmp = checksum_cmp_update(checksum_val, &stable_node->checksum,
+					  stable_node, &early_exit);
+
+		/* TODO: consider tree manipulation */
+		if (early_exit == 1)
 			return NULL;
 
-		//ret = memcmp_pages(page, tree_page);
-		cmp = checksum_cmp_update(checksum_val, &stable_node->checksum,
-					  tree_page);
-
 		if (cmp < 0) {
-			put_page(tree_page);
 			node = node->rb_left;
 		} else if (cmp > 0) {
-			put_page(tree_page);
 			node = node->rb_right;
-		} else
+		} else {
+			tree_page = get_ksm_page(stable_node);
 			return tree_page;
+		}
 	}
 
 	return NULL;
@@ -1383,34 +1458,26 @@ static struct page *stable_tree_search(struct page *page, u32 checksum_val)
  * This function returns the stable tree node just allocated on success,
  * NULL otherwise.
  */
-static struct stable_node *stable_tree_insert(struct page *kpage)
+static struct stable_node *stable_tree_insert(struct page *kpage, u32 checksum_val)
 {
 	struct rb_node **new = &root_stable_tree.rb_node;
 	struct rb_node *parent = NULL;
 	struct stable_node *stable_node;
-	u32 checksum_val;
 	unsigned long tmp;
-
-	/* now it's write_protected, re-calc checksum */
-	checksum_val = calc_checksum(kpage, 1);
 
 	while (*new) {
 		struct page *tree_page;
-		int cmp, ret;
+		int cmp, ret, early_exit = 0;
 
 		cond_resched();
 		stable_node = rb_entry(*new, struct stable_node, node);
 
-		tree_page = get_ksm_page(stable_node);
-		if (!tree_page)
-			return NULL;
-
 		//ret = memcmp_pages(kpage, tree_page);
 		cmp = checksum_cmp_update(checksum_val, &stable_node->checksum,
-					  tree_page);
-		put_page(tree_page);
+					  stable_node, &early_exit);
 
-
+		if (early_exit)
+			return NULL;
 
 		parent = *new;
 		if (cmp < 0)
@@ -1491,34 +1558,31 @@ struct rmap_item *unstable_tree_search_insert(struct rmap_item *rmap_item,
 
 		cond_resched();
 		tree_rmap_item = rb_entry(*new, struct rmap_item, node);
-		tree_page = get_mergeable_page_lock_mmap(tree_rmap_item);
-		if (!tree_page)
-			return NULL;
 
-		/*
-		 * Don't substitute a ksm page for a forked page.
-		 */
-		if (page == tree_page) {
-			put_page(tree_page);
-			up_read(&tree_rmap_item->slot->vma->vm_mm->mmap_sem);
-			return NULL;
-		}
-
-		//ret = memcmp_pages(page, tree_page);
 		cmp = checksum_cmp_update(checksum_val,
 					  &tree_rmap_item->oldchecksum,
-					  tree_page);
+					  NULL, NULL);
 
 		parent = *new;
 		if (cmp < 0) {
-			put_page(tree_page);
-			up_read(&tree_rmap_item->slot->vma->vm_mm->mmap_sem);
+			//up_read(&tree_rmap_item->slot->vma->vm_mm->mmap_sem);
 			new = &parent->rb_left;
 		} else if (cmp > 0) {
-			put_page(tree_page);
-			up_read(&tree_rmap_item->slot->vma->vm_mm->mmap_sem);
+			//up_read(&tree_rmap_item->slot->vma->vm_mm->mmap_sem);
 			new = &parent->rb_right;
 		} else {
+			tree_page = get_mergeable_page_lock_mmap(tree_rmap_item);
+			if (!tree_page)
+				return NULL;
+			/*
+			 * Don't substitute a ksm page for a forked page.
+			 */
+			if (page == tree_page) {
+				up_read(&tree_rmap_item->slot->vma->vm_mm->mmap_sem);
+				put_page(tree_page);
+				return NULL;
+			}
+
 			*tree_pagep = tree_page;
 			return tree_rmap_item;
 		}
@@ -1739,6 +1803,7 @@ static void cmp_and_merge_page(struct page *page, struct rmap_item *rmap_item)
 		return;
 	}*/
 
+
 	tree_rmap_item =
 		unstable_tree_search_insert(rmap_item, page, &tree_page, checksum_val);
 	if (tree_rmap_item) {
@@ -1756,7 +1821,7 @@ static void cmp_and_merge_page(struct page *page, struct rmap_item *rmap_item)
 */
 			remove_rmap_item_from_tree(tree_rmap_item);
 			lock_page(kpage);
-			stable_node = stable_tree_insert(kpage);
+			stable_node = stable_tree_insert(kpage, checksum_val);
 			if (stable_node) {
 				stable_tree_append(tree_rmap_item, stable_node);
 				stable_tree_append(rmap_item, stable_node);
@@ -2726,9 +2791,9 @@ out:
 	rshash_adjust();
 }
 
-static inline unsigned int ksm_pages_to_scan(unsigned int millionth_ratio)
+static inline unsigned int ksm_pages_to_scan(unsigned int batch_pages)
 {
-	return totalram_pages * millionth_ratio / 1000000;
+	return totalram_pages * batch_pages / 1000000;
 }
 
 static void inline cal_ladder_pages_to_scan(unsigned int num)
@@ -2888,7 +2953,7 @@ pre_next_round:
 		ksm_scan_round++;
 		root_unstable_tree = RB_ROOT;
 	}
-	cal_ladder_pages_to_scan(ksm_pages_to_scan(ksm_scan_millionth_ratio));
+	cal_ladder_pages_to_scan(ksm_scan_batch_pages);
 }
 
 static int ksmd_should_run(void)
@@ -3011,7 +3076,7 @@ static int ksm_scan_thread(void *nothing)
 
 		if (ksmd_should_run()) {
 			schedule_timeout_interruptible(
-				ksm_mips_time_to_jiffies(ksm_thread_sleep_mips_time));
+				msecs_to_jiffies(ksm_thread_sleep_millisecs));
 		} else {
 			wait_event_interruptible(ksm_thread_wait,
 				ksmd_should_run() || kthread_should_stop());
@@ -3293,28 +3358,28 @@ static int ksm_memory_callback(struct notifier_block *self,
 	static struct kobj_attribute _name##_attr = \
 		__ATTR(_name, 0644, _name##_show, _name##_store)
 
-static ssize_t sleep_mips_time_show(struct kobject *kobj,
+static ssize_t sleep_millisecs_show(struct kobject *kobj,
 				    struct kobj_attribute *attr, char *buf)
 {
-	return sprintf(buf, "%u\n", ksm_thread_sleep_mips_time);
+	return sprintf(buf, "%u\n", ksm_thread_sleep_millisecs);
 }
 
-static ssize_t sleep_mips_time_store(struct kobject *kobj,
+static ssize_t sleep_millisecs_store(struct kobject *kobj,
 				     struct kobj_attribute *attr,
 				     const char *buf, size_t count)
 {
-	unsigned long nr_mips;
+	unsigned long msecs;
 	int err;
 
-	err = strict_strtoul(buf, 10, &nr_mips);
-	if (err || nr_mips > UINT_MAX)
+	err = strict_strtoul(buf, 10, &msecs);
+	if (err || msecs > UINT_MAX)
 		return -EINVAL;
 
-	ksm_thread_sleep_mips_time = nr_mips;
+	ksm_thread_sleep_millisecs = msecs;
 
 	return count;
 }
-KSM_ATTR(sleep_mips_time);
+KSM_ATTR(sleep_millisecs);
 
 //-------------------------------------------------------
 static ssize_t min_scan_ratio_show(struct kobject *kobj,
@@ -3343,29 +3408,29 @@ KSM_ATTR(min_scan_ratio);
 //-------------------------------------------------------
 
 
-static ssize_t scan_millionth_ratio_show(struct kobject *kobj,
+static ssize_t scan_batch_pages_show(struct kobject *kobj,
 				  struct kobj_attribute *attr, char *buf)
 {
-	return sprintf(buf, "%u\n", ksm_scan_millionth_ratio);
+	return sprintf(buf, "%lu\n", ksm_scan_batch_pages);
 }
 
-static ssize_t scan_millionth_ratio_store(struct kobject *kobj,
+static ssize_t scan_batch_pages_store(struct kobject *kobj,
 				   struct kobj_attribute *attr,
 				   const char *buf, size_t count)
 {
 	int err;
-	unsigned long millionth_ratio;
+	unsigned long batch_pages;
 
-	err = strict_strtoul(buf, 10, &millionth_ratio);
-	if (err || millionth_ratio > UINT_MAX)
+	err = strict_strtoul(buf, 10, &batch_pages);
+	if (err || batch_pages > UINT_MAX)
 		return -EINVAL;
 
-	ksm_scan_millionth_ratio = millionth_ratio;
-	cal_ladder_pages_to_scan(ksm_pages_to_scan(ksm_scan_millionth_ratio));
+	ksm_scan_batch_pages = batch_pages;
+	cal_ladder_pages_to_scan(ksm_scan_batch_pages);
 
 	return count;
 }
-KSM_ATTR(scan_millionth_ratio);
+KSM_ATTR(scan_batch_pages);
 
 static ssize_t run_show(struct kobject *kobj, struct kobj_attribute *attr,
 			char *buf)
@@ -3460,8 +3525,8 @@ KSM_ATTR_RO(pages_scanned);
 
 
 static struct attribute *ksm_attrs[] = {
-	&sleep_mips_time_attr.attr,
-	&scan_millionth_ratio_attr.attr,
+	&sleep_millisecs_attr.attr,
+	&scan_batch_pages_attr.attr,
 	&run_attr.attr,
 	&pages_shared_attr.attr,
 	&pages_sharing_attr.attr,
@@ -3484,9 +3549,9 @@ static void inline init_scan_ladder(void)
 	int i;
 	unsigned long mul = 1;
 
-	unsigned int pages_to_scan;
+	unsigned long pages_to_scan;
 
-	pages_to_scan = ksm_pages_to_scan(ksm_scan_millionth_ratio);
+	pages_to_scan = ksm_scan_batch_pages;
 
 	for (i = 0; i < ksm_scan_ladder_size; i++, mul *= ksm_scan_ratio_delta) {
 		ksm_scan_ladder[i].scan_ratio = ksm_min_scan_ratio * mul;
