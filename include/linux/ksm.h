@@ -150,11 +150,15 @@ struct ksm_checksum {
  * @kpfn: page frame number of this ksm page
  */
 struct stable_node {
+	//unsigned long status; /* is it in rb tree or in a collision list ?*/
 	struct rb_node node;
+	struct list_head collision; /* hash collision list */
 	struct hlist_head hlist;
 	unsigned long kpfn;
-	struct ksm_checksum checksum;
-	struct vm_area_struct *old_vma;
+	//struct ksm_checksum checksum;
+	u32 checksum_val;
+	//struct vm_area_struct *old_vma;
+	struct list_head all_list; /* in a list for all stable nodes */
 };
 
 /**
@@ -184,16 +188,18 @@ struct node_vma {
  * @hlist: link into hlist of rmap_items hanging off that stable_node
  */
 struct rmap_item {
-	struct anon_vma *anon_vma;	/* when stable */
+	//struct anon_vma *anon_vma;	/* when stable */
+	struct list_head collision; /* hash collision list */
 	struct vma_slot *slot;
 	unsigned long address;	/* + low bits used for flags below */
+	struct page *page;
 	/* Appendded to (un)stable tree on which scan round */
 	unsigned long append_round;
 
 	/* Which rung scan turn it was last scanned */
 	//unsigned long last_scan;
 	unsigned long entry_index;
-	struct ksm_checksum oldchecksum;	/* when unstable */
+	u32 checksum_val;	/* when unstable */
 	union {
 		struct rb_node node;	/* when node of unstable tree */
 		struct {		/* when listed from stable tree's node_vma */
