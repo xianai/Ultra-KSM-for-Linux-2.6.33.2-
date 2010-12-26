@@ -104,7 +104,7 @@ int memcmpx86 (void *__s1, void *__s2, size_t __n)
 
 
 
-
+#define get_rmap_addr(x)	((x)->address & PAGE_MASK)
 
 
 
@@ -478,7 +478,7 @@ static void break_cow(struct rmap_item *rmap_item)
 {
 	struct vm_area_struct *vma = rmap_item->slot->vma;
 	struct mm_struct *mm = vma->vm_mm;
-	unsigned long addr = rmap_item->address;
+	unsigned long addr = get_rmap_addr(rmap_item);
 
 	/*
 	 * It is not an accident that whenever we want to break COW
@@ -512,6 +512,12 @@ static void ksm_intertab_clear(struct vma_slot *slot)
 
 }
 
+static inline int stable_node_is_rbnode(struct stable_node *snode)
+{
+	return (rb_parent(&snode->node) || root_stable_tree.rb_node == &snode->node);
+}
+
+
 /*
  * Returns the next collision node that has replaced this node,
  * returns NULL if it has no collision.
@@ -521,7 +527,6 @@ static struct stable_node *remove_node_from_stable_tree(struct stable_node *stab
 	struct node_vma *node_vma;
 	struct rmap_item *rmap_item;
 	struct hlist_node *hlist, *rmap_hlist, *n;
-	unsigned long status;
 
 	struct stable_node *newnode = NULL;
 
@@ -683,30 +688,6 @@ static struct rmap_item *unstable_rmap_roll(struct rmap_item *tree_item)
 	return next_item;
 }
 
-/*
- * return the page if it's get from tree_rmap_item,
- * return NULL, if page cannot be get from tree_rmap_item and if colli_item not NULL,
- * this rb_tree node has been replaced by the colli_item.     									    ,
- */
-static int get_tree_rmap_item_page(struct rmap_item *tree_rmap_item,
-					    struct rmap_item **colli_item)
-{
-	struct page *tree_page;
-	int err;
-
-	err = get_mergeable_page_lock_mmap(tree_rmap_item);
-
-	if (err == -EBUSY) {
-		/* his mmap_sem cannot be locked, roll to another one */
-		*colli_item = unstable_rmap_roll(tree_rmap_item);
-	} else if (err == -EINVAL) {
-		/* its page map has been changed, remove it */
-		*colli_item = remove_rmap_item_from_tree(tree_rmap_item);
-	}
-
-	/* The page is gotten and mmap_sem is locked now. */
-	return err;
-}
 
 
 static inline int rmap_item_is_rbnode(struct rmap_item *item)
@@ -716,7 +697,7 @@ static inline int rmap_item_is_rbnode(struct rmap_item *item)
 
 static inline struct rmap_item *next_rmap_colli(struct rmap_item *item)
 {
-	return list_entry(&item->collision.next, struct rmap_item, collision);
+	return list_entry(item->collision.next, struct rmap_item, collision);
 }
 
 /*
@@ -724,7 +705,7 @@ static inline struct rmap_item *next_rmap_colli(struct rmap_item *item)
  * This function will clean the information from the stable/unstable tree.
  * return the next hash collision rmap_item if possible, otherwise NULL
  */
-static void remove_rmap_item_from_tree(struct rmap_item *rmap_item)
+static struct rmap_item *remove_rmap_item_from_tree(struct rmap_item *rmap_item)
 {
 	struct rmap_item *next_item = NULL;
 
@@ -735,13 +716,13 @@ static void remove_rmap_item_from_tree(struct rmap_item *rmap_item)
 
 		node_vma = rmap_item->head;
 		stable_node = node_vma->head;
-		page = get_ksm_page(stable_node);
+		page = get_ksm_page(stable_node, NULL);
 		if (!page)
 			goto out;
 
-		lock_page(page);
+		//lock_page(page);
 		hlist_del(&rmap_item->hlist);
-		unlock_page(page);
+		//unlock_page(page);
 		put_page(page);
 
 		if (node_vma->rmap_hlist.first)
@@ -777,7 +758,7 @@ static void remove_rmap_item_from_tree(struct rmap_item *rmap_item)
 					next_item = next_rmap_colli(rmap_item);
 					rb_replace_node(&rmap_item->node,
 							&next_item->node,
-							root_unstable_tree);
+							&root_unstable_tree);
 					list_del_init(&rmap_item->collision);
 				} else
 					rb_erase(&rmap_item->node,
@@ -940,11 +921,26 @@ static int down_read_slot_mmap_sem(struct vma_slot *slot)
 	return -EBUSY;
 }
 
+static inline unsigned long
+vma_page_address(struct page *page, struct vm_area_struct *vma)
+{
+	pgoff_t pgoff = page->index << (PAGE_CACHE_SHIFT - PAGE_SHIFT);
+	unsigned long address;
+
+	address = vma->vm_start + ((pgoff - vma->vm_pgoff) << PAGE_SHIFT);
+	if (unlikely(address < vma->vm_start || address >= vma->vm_end)) {
+		/* page should be within @vma mapping range */
+		return -EFAULT;
+	}
+	return address;
+}
+
+
 /* return 0 on success with item's mmap_sem locked */
 static int get_mergeable_page_lock_mmap(struct rmap_item *item)
 {
 	struct mm_struct *mm;
-	unsigned long addr = item->address;
+	//unsigned long addr = item->address;
 	struct vm_area_struct *vma;
 	//struct page *page;
 	struct vma_slot *slot = item->slot;
@@ -974,7 +970,7 @@ static int get_mergeable_page_lock_mmap(struct rmap_item *item)
 		goto failout_up;
 	}
 	if (item->slot->vma->anon_vma != page_anon_vma(page) ||
-	    vma_address(page, item->slot->vma) != item->address & PAGE_MASK) {
+	    vma_page_address(page, item->slot->vma) != get_rmap_addr(item)) {
 		put_page(page);
 		rcu_read_unlock();
 		goto failout_up;
@@ -1002,6 +998,29 @@ failout_up:
 	return err;
 }
 
+/*
+ * return the page if it's get from tree_rmap_item,
+ * return NULL, if page cannot be get from tree_rmap_item and if colli_item not NULL,
+ * this rb_tree node has been replaced by the colli_item.     									    ,
+ */
+static int get_tree_rmap_item_page(struct rmap_item *tree_rmap_item,
+					    struct rmap_item **colli_item)
+{
+	int err;
+
+	err = get_mergeable_page_lock_mmap(tree_rmap_item);
+
+	if (err == -EBUSY) {
+		/* his mmap_sem cannot be locked, roll to another one */
+		*colli_item = unstable_rmap_roll(tree_rmap_item);
+	} else if (err == -EINVAL) {
+		/* its page map has been changed, remove it */
+		*colli_item = remove_rmap_item_from_tree(tree_rmap_item);
+	}
+
+	/* The page is gotten and mmap_sem is locked now. */
+	return err;
+}
 
 
 
@@ -1309,6 +1328,11 @@ out:
 	return err;
 }
 
+#define MERGE_ERR_PGERR		1 /* the page is invalid cannot continue */
+#define MERGE_ERR_COLLI		2 /* there is a collision */
+#define MERGE_ERR_CHANGED	3 /* the page has changed since lash hash */
+
+
 /**
  * replace_page - replace page in vma by new ksm page
  * @vma:      vma that holds the pte pointing to page
@@ -1368,9 +1392,6 @@ out:
 	return err;
 }
 
-#define MERGE_ERR_PGERR		1 /* the page is invalid cannot continue */
-#define MERGE_ERR_COLLI		2 /* there is a collision */
-#define MERGE_ERR_CHANGED	3 /* the page has changed since lash hash */
 /*
  * try_to_merge_one_page - take two pages and merge them into one
  * @vma: the vma that holds the pte pointing to page
@@ -1550,6 +1571,7 @@ static inline int checksum_cmp(u32 new_val, u32 node_val)
 		return 0;
 }
 
+/*
 static inline int checksum_cmp_update(u32 checksum_val,
 				      struct ksm_checksum *node_checksum,
 				      struct stable_node *stable_node,
@@ -1559,8 +1581,6 @@ static inline int checksum_cmp_update(u32 checksum_val,
 	u32 val;
 
 	if (node_checksum->sample_num != current_sample_num) {
-		/* all pages in unstable tree are built in the same scan round,
-		   so must have same sample_num */
 		if (!stable_node) {
 			printk(KERN_ERR "KSM: BUG current_sample_num is %lu, while %lu is node_checksum->sample_num\n",
 			       current_sample_num, node_checksum->sample_num);
@@ -1588,6 +1608,7 @@ static inline int checksum_cmp_update(u32 checksum_val,
 	else
 		return 0;
 }
+*/
 
 static inline void checksum_copy2(u32 val, struct ksm_checksum *node_checksum)
 {
@@ -1641,10 +1662,6 @@ static struct stable_node *stable_tree_search(struct page *page, u32 checksum_va
 	return NULL;
 }
 
-static inline int stable_node_is_rbnode(struct stable_node *snode)
-{
-	return (rb_parent(&snode->node) || root_stable_tree.rb_node == &snode->node);
-}
 
 
 static inline void stable_collision_insert(struct stable_node *new_node,
@@ -1725,7 +1742,7 @@ static void try_to_merge_with_tree_page(struct vm_area_struct *vma1,
 	if (addr1 == -EFAULT)
 		goto failed;
 
-	ptep1 = page_check_address(page, vma1->vm_mm, addr1, &ptl1, 0);
+	ptep1 = page_check_address(oldpage, vma1->vm_mm, addr1, &ptl1, 0);
 	if (!ptep1)
 		goto failed;
 
@@ -1756,7 +1773,7 @@ static void try_to_merge_with_tree_page(struct vm_area_struct *vma1,
 		goto success1;
 	}
 
-	ptep2 = page_check_address(page, vma2->vm_mm, addr2, &ptl2, 0);
+	ptep2 = page_check_address(oldpage, vma2->vm_mm, addr2, &ptl2, 0);
 	if (!ptep2)
 		goto success1;
 
@@ -1805,6 +1822,30 @@ success1:
 failed:
 	return;
 }
+
+/**
+ * If it has no collision node, return NULL, else make the next
+ * collision node the tree node and return it.
+ *
+ *
+ * @return struct stable_node*
+ */
+static struct stable_node *stable_node_roll(struct stable_node *snode)
+{
+	struct stable_node *scolli_node;
+
+	if (list_empty(&snode->collision))
+		return NULL;
+
+	scolli_node = list_entry(snode->collision.next,
+		     struct stable_node, collision);
+	rb_replace_node(&snode->node, &scolli_node->node,
+			&root_stable_tree);
+	snode->node.rb_parent_color = 0;
+
+	return scolli_node;
+}
+
 
 
 /*
@@ -1865,7 +1906,7 @@ stable_tree_insert(struct page *kpage, u32 checksum_val,
 					break;
 				}
 
-				stable_node = colli_node
+				stable_node = colli_node;
 				if (start_node && start_node == colli_node) {
 					/*
 					 * we have searched all the collisions
@@ -2004,6 +2045,12 @@ struct rmap_item *unstable_tree_search_insert(struct rmap_item *rmap_item,
 	rmap_item->checksum_val = checksum_val;
 	rb_link_node(&rmap_item->node, parent, new);
 	rb_insert_color(&rmap_item->node, &root_unstable_tree);
+
+	/* all link related members should be initialized
+	 * because we use root_unstable_tree = RB_ROOT to
+	 * clear all nodes.
+	 */
+	INIT_LIST_HEAD(&rmap_item->collision);
 
 	ksm_pages_unshared++;
 	return NULL;
@@ -2152,28 +2199,6 @@ node_vma_ok: /* ok, ready to add to the list */
 		ksm_pages_shared++;
 }
 
-/**
- * If it has no collision node, return NULL, else make the next
- * collision node the tree node and return it.
- *
- *
- * @return struct stable_node*
- */
-static struct stable_node *stable_node_roll(struct stable_node *snode)
-{
-	stable_node *scolli_node;
-
-	if (list_empty(&snode->collision))
-		return NULL;
-
-	scolli_node = list_entry(snode->collision.next,
-		     struct stable_node, collision);
-	rb_replace_node(&snode->node, &scolli_node->node,
-			&root_stable_tree);
-	snode->node.rb_parent_color = 0;
-
-	return scolli_node;
-}
 
 /*
  * Insert new_item to the collision list of tree_item
@@ -2199,11 +2224,11 @@ static inline void rmap_collision_insert(struct rmap_item *new_item,
  * @page: the page that we are searching identical page to.
  * @rmap_item: the reverse mapping into the virtual address of this page
  */
-static void cmp_and_merge_page(struct page *page, struct rmap_item *rmap_item)
+static void cmp_and_merge_page(struct rmap_item *rmap_item)
 {
 	struct rmap_item *tree_rmap_item, *tree_colli_item;
 	struct rmap_item *tree_item_saved, *tree_item_start;
-	struct page *tree_page = NULL;
+	struct page *page, *tree_page = NULL;
 	//struct stable_node *stable_node;
 	struct page *kpage = NULL;
 	u32 checksum_val;
@@ -2214,6 +2239,7 @@ static void cmp_and_merge_page(struct page *page, struct rmap_item *rmap_item)
 
 	remove_rmap_item_from_tree(rmap_item);
 
+	page = rmap_item->page;
 	checksum_val = calc_checksum(page, 1);
 	rmap_item->checksum_val = checksum_val;
 
@@ -2321,7 +2347,7 @@ repeat_rmap_collision:
 			err = get_tree_rmap_item_page(tree_rmap_item,
 						      &tree_colli_item);
 
-			/* if err == -EINVAL, its item will be removed */
+			/* if err == -EINVAL, its item was removed */
 			if (err != -EINVAL && !tree_item_start)
 				tree_item_start = tree_rmap_item;
 
@@ -2370,19 +2396,19 @@ repeat_rmap_collision:
 			kpage = page;
 			remove_rmap_item_from_tree(tree_rmap_item);
 			lock_page(kpage);
-			stable_node = stable_tree_insert(kpage, checksum_val,
+			snode = stable_tree_insert(kpage, checksum_val,
 						tree_rmap_item->slot->vma,
 						rmap_item->slot->vma,
 						&success1, &success2);
 			unlock_page(kpage);
 
 			if (success1)
-				stable_tree_append(tree_rmap_item, stable_node);
+				stable_tree_append(tree_rmap_item, snode);
 			else
 				break_cow(tree_rmap_item);
 
 			if (success2)
-				stable_tree_append(rmap_item, stable_node);
+				stable_tree_append(rmap_item, snode);
 			else
 				break_cow(rmap_item);
 
@@ -2502,7 +2528,7 @@ static inline unsigned long get_entry_address(struct rmap_list_entry *entry)
 	if (is_addr(entry->addr)) {
 		addr = get_clean_addr(entry->addr);
 	} else if (entry->item) {
-		addr = entry->item->address & PAGE_MASK;
+		addr = get_rmap_addr(entry->item);
 	} else
 		BUG();
 
@@ -2584,7 +2610,7 @@ static inline void free_entry_item(struct rmap_list_entry *entry)
 	if (!is_addr(entry->addr)) {
 		BUG_ON(!entry->item);
 		item = entry->item;
-		entry->addr = item->address & PAGE_MASK;
+		entry->addr = get_rmap_addr(item);
 		set_is_addr(entry->addr);
 		index = item->entry_index;
 		remove_rmap_item_from_tree(item);
@@ -2616,9 +2642,9 @@ static inline void try_free_last_pool(struct vma_slot *slot,
 }
 
 static inline unsigned long vma_item_index(struct vm_area_struct *vma,
-						struct rmap_item *item)
+					   struct rmap_item *item)
 {
-	return (((item->address & PAGE_MASK) - vma->vm_start) >> PAGE_SHIFT);
+	return ((get_rmap_addr(item) - vma->vm_start) >> PAGE_SHIFT);
 }
 
 static int within_same_pool(struct vma_slot *slot,
@@ -2894,9 +2920,9 @@ static void scan_vma_one_page(struct vma_slot *slot)
 	if (PageKsm(rmap_item->page) && in_stable_tree(rmap_item))
 		goto out2;
 
-	cmp_and_merge_page(rmap_item);
+	//cmp_and_merge_page(rmap_item);
 out2:
-	put_page(page);
+	put_page(rmap_item->page);
 out1:
 	//rmap_item->last_scan = slot->rung->scan_turn;
 	slot->rung->pages_to_scan--;
@@ -3198,7 +3224,7 @@ static inline void stable_tree_delta_hash(u32 prev_sample_num)
 	struct stable_node *node, *tmp;
 
 	root_stable_tree = RB_ROOT;
-	list_for_each_entry_safe(node, tmp, stable_node_list, nlist) {
+	list_for_each_entry_safe(node, tmp, &stable_node_list, all_list) {
 		void *addr;
 		struct page *node_page;
 
@@ -3208,14 +3234,15 @@ static inline void stable_tree_delta_hash(u32 prev_sample_num)
 		 */
 		node->node.rb_parent_color = 0;
 		INIT_LIST_HEAD(&node->collision);
-		node_page = get_ksm_page(node);
+		node_page = get_ksm_page(node, NULL);
 		if (!node_page)
 			continue;
 
 		addr = kmap_atomic(node_page, KM_USER0);
 
 		node->checksum_val = delta_hash(addr, prev_sample_num,
-						current_sample_num);
+						current_sample_num,
+						node->checksum_val);
 		kunmap_atomic(addr, KM_USER0);
 		put_page(node_page);
 		stable_node_reinsert(node);
@@ -3812,14 +3839,16 @@ again:
 	hlist_for_each_entry(node_vma, hlist, &stable_node->hlist, hlist) {
 		hlist_for_each_entry(rmap_item, rmap_hlist,
 				     &node_vma->rmap_hlist, hlist) {
-			struct anon_vma *anon_vma = rmap_item->anon_vma;
+			struct anon_vma *anon_vma = rmap_item->slot->vma->anon_vma;
 			struct vm_area_struct *vma;
 
 			spin_lock(&anon_vma->lock);
 			list_for_each_entry(vma, &anon_vma->head,
 					    anon_vma_node) {
-				if (rmap_item->address < vma->vm_start ||
-				    rmap_item->address >= vma->vm_end)
+				unsigned long address = get_rmap_addr(rmap_item);
+
+				if (address < vma->vm_start ||
+				    address >= vma->vm_end)
 					continue;
 				/*
 				 * Initially we examine only the vma which
@@ -3835,8 +3864,7 @@ again:
 					continue;
 
 				referenced +=
-					page_referenced_one(page, vma,
-							    rmap_item->address,
+					page_referenced_one(page, vma, address,
 							    &mapcount, vm_flags);
 				if (!search_new_forks || !mapcount)
 					break;
@@ -3871,14 +3899,16 @@ again:
 	hlist_for_each_entry(node_vma, hlist, &stable_node->hlist, hlist) {
 		hlist_for_each_entry(rmap_item, rmap_hlist,
 				     &node_vma->rmap_hlist, hlist) {
-			struct anon_vma *anon_vma = rmap_item->anon_vma;
+			struct anon_vma *anon_vma = rmap_item->slot->vma->anon_vma;
 			struct vm_area_struct *vma;
 
 			spin_lock(&anon_vma->lock);
 			list_for_each_entry(vma, &anon_vma->head,
 					    anon_vma_node) {
-				if (rmap_item->address < vma->vm_start ||
-				    rmap_item->address >= vma->vm_end)
+				unsigned long address = get_rmap_addr(rmap_item);
+
+				if (address < vma->vm_start ||
+				    address >= vma->vm_end)
 					continue;
 				/*
 				 * Initially we examine only the vma which covers this
@@ -3889,8 +3919,7 @@ again:
 				if ((rmap_item->slot->vma == vma) == search_new_forks)
 					continue;
 
-				ret = try_to_unmap_one(page, vma,
-						       rmap_item->address, flags);
+				ret = try_to_unmap_one(page, vma, address, flags);
 				if (ret != SWAP_AGAIN || !page_mapped(page)) {
 					spin_unlock(&anon_vma->lock);
 					goto out;
@@ -3931,8 +3960,10 @@ again:
 
 			spin_lock(&anon_vma->lock);
 			list_for_each_entry(vma, &anon_vma->head, anon_vma_node) {
-				if (rmap_item->address < vma->vm_start ||
-				    rmap_item->address >= vma->vm_end)
+				unsigned long address = get_rmap_addr(rmap_item);
+
+				if (address < vma->vm_start ||
+				    address >= vma->vm_end)
 					continue;
 				/*
 				 * Initially we examine only the vma which covers this
@@ -3943,7 +3974,7 @@ again:
 				if ((rmap_item->slot->vma == vma) == search_new_forks)
 					continue;
 
-				ret = rmap_one(page, vma, rmap_item->address, arg);
+				ret = rmap_one(page, vma, address, arg);
 				if (ret != SWAP_AGAIN) {
 					spin_unlock(&anon_vma->lock);
 					goto out;
