@@ -322,6 +322,7 @@ static inline struct vma_slot *alloc_vma_slot(void)
 		INIT_LIST_HEAD(&slot->ksm_list);
 		INIT_LIST_HEAD(&slot->slot_list);
 		slot->ksm_index = -1;
+		slot->need_rerand = 1;
 	}
 	return slot;
 }
@@ -1277,7 +1278,7 @@ static inline int pages_identical(struct page *page1, struct page *page2)
 }
 
 static int write_protect_page(struct vm_area_struct *vma, struct page *page,
-			      pte_t *orig_pte)
+			      pte_t *orig_pte, pte_t *old_pte)
 {
 	struct mm_struct *mm = vma->vm_mm;
 	unsigned long addr;
@@ -1317,6 +1318,8 @@ static int write_protect_page(struct vm_area_struct *vma, struct page *page,
 			set_pte_at_notify(mm, addr, ptep, entry);
 			goto out_unlock;
 		}
+		if (old_pte)
+			*old_pte = entry;
 		entry = pte_wrprotect(entry);
 		set_pte_at_notify(mm, addr, ptep, entry);
 	}
@@ -1446,7 +1449,7 @@ static int try_to_merge_one_page(struct vm_area_struct *vma, struct page *page,
 	 * ptes are necessarily already write-protected.  But in either
 	 * case, we need to lock and check page_count is not raised.
 	 */
-	if (write_protect_page(vma, page, &orig_pte) == 0) {
+	if (write_protect_page(vma, page, &orig_pte, NULL) == 0) {
 		if (!kpage) {
 			long map_sharing = atomic_read(&page->_mapcount);
 			/*
@@ -1530,6 +1533,48 @@ out:
 	return err;
 }
 
+
+
+static void restore_page_pte(struct vm_area_struct *vma, unsigned long addr,
+			     struct page *page, pte_t wprt_pte)
+{
+	struct mm_struct *mm = vma->vm_mm;
+	pgd_t *pgd;
+	pud_t *pud;
+	pmd_t *pmd;
+	pte_t *ptep;
+	spinlock_t *ptl;
+	//unsigned long addr;
+	//int err = MERGE_ERR_PGERR;
+
+	pgd = pgd_offset(mm, addr);
+	if (!pgd_present(*pgd))
+		goto out;
+
+	pud = pud_offset(pgd, addr);
+	if (!pud_present(*pud))
+		goto out;
+
+	pmd = pmd_offset(pud, addr);
+	if (!pmd_present(*pmd))
+		goto out;
+
+	ptep = pte_offset_map_lock(mm, pmd, addr, &ptl);
+	if (!pte_same(*ptep, wprt_pte)) {
+		pte_unmap_unlock(ptep, ptl);
+		goto out;
+	}
+
+
+	flush_cache_page(vma, addr, pte_pfn(*ptep));
+	ptep_clear_flush(vma, addr, ptep);
+	set_pte_at_notify(mm, addr, ptep, mk_pte(page, vma->vm_page_prot));
+
+	pte_unmap_unlock(ptep, ptl);
+out:
+	return;
+
+}
 /*
  * try_to_merge_two_pages - take two identical pages and prepare them
  * to be merged into one page.
@@ -1545,19 +1590,117 @@ static int try_to_merge_two_pages(struct rmap_item *rmap_item,
 					   struct rmap_item *tree_rmap_item,
 					   struct page *tree_page)
 {
+	pte_t orig_pte1 = __pte(0), orig_pte2 = __pte(0);
+	pte_t wprt_pte1 = __pte(0), wprt_pte2 = __pte(0);
+	struct vm_area_struct *vma1 = rmap_item->slot->vma;
+	struct vm_area_struct *vma2 = tree_rmap_item->slot->vma;
+	//struct mm_struct *mm1 = vma1->vm_mm;
+	//struct mm_struct *mm2 = vma2->vm_mm;
+	//pte_t *ptep1, *ptep2;
+	//unsigned long addr1, addr2;
+	//spinlock_t *ptl1, *ptl2;
+	//int swapped;
+	int err = MERGE_ERR_PGERR;
+	unsigned long tmp;
+	long map_sharing;
+
+
+
+	if (!PageAnon(page) || !PageAnon(tree_page))
+		goto out;
+
+	lock_page(page);
+	if (write_protect_page(vma1, page, &wprt_pte1, &orig_pte1) != 0) {
+		unlock_page(page);
+		goto out;
+	}
+	unlock_page(page);
+
+	lock_page(tree_page);
+	if (write_protect_page(vma2, tree_page, &wprt_pte2, &orig_pte2) != 0) {
+		unlock_page(tree_page);
+		goto restore1_out;
+	}
+
+	if (pages_identical(page, tree_page)) {
+		err = replace_page(vma2, tree_page, page, wprt_pte2);
+		if (err)
+			goto restore_both_out;
+
+
+		/*
+		 * While we hold page lock, upgrade page from
+		 * PageAnon+anon_vma to PageKsm+NULL stable_node:
+		 * stable_tree_insert() will update stable_node.
+		 */
+		if ((vma2->vm_flags & VM_LOCKED))
+			munlock_vma_page(tree_page);
+
+		unlock_page(tree_page);
+
+		lock_page(page);
+		map_sharing = atomic_read(&page->_mapcount);
+		set_page_stable_node(page, NULL);
+		if (map_sharing)
+			add_zone_page_state(page_zone(page),
+					    NR_KSM_PAGES_SHARING,
+					    map_sharing);
+		mark_page_accessed(page);
+		if ((vma2->vm_flags & VM_LOCKED)) {
+			if (!PageMlocked(page)) {
+				mlock_vma_page(page);
+			}
+		}
+		unlock_page(page);
+
+
+		goto out; /* success */
+
+	} else {
+		if (calc_checksum(page, 0) ==
+		    calc_checksum(tree_page, 0)) {
+			/**
+			 * We compare the checksum again, to
+			 * ensure that it is really a hash
+			 * collision instead of being caused
+			 * by page write.
+			 */
+			tmp = rshash_neg;
+			rshash_neg += memcmp_cost;
+			BUG_ON(tmp > rshash_neg);
+			err = MERGE_ERR_COLLI;
+		} else {
+			err = MERGE_ERR_CHANGED;
+		}
+
+		unlock_page(tree_page);
+		goto restore_both_out;
+	}
+
+
+
+
+
+
+/*
 	int err;
 
 	err = try_to_merge_with_ksm_page(rmap_item, page, NULL, NULL);
 	if (!err) {
 		err = try_to_merge_with_ksm_page(tree_rmap_item,
 						tree_page, page, NULL);
-		/*
-		 * If that fails, we have a ksm page with only one pte
-		 * pointing to it: so break it.
-		 */
 		if (err)
 			break_cow(rmap_item);
 	}
+	return err;
+*/
+restore_both_out:
+	restore_page_pte(vma2, tree_rmap_item->address & PAGE_MASK,
+			 tree_page, wprt_pte2);
+restore1_out:
+	restore_page_pte(vma1, rmap_item->address & PAGE_MASK,
+			 page, wprt_pte1);
+out:
 	return err;
 }
 
@@ -1679,8 +1822,8 @@ static inline void stable_collision_insert(struct stable_node *new_node,
 /*
  * oldpage is already locked.
  */
-static void try_to_merge_with_tree_page(struct vm_area_struct *vma1,
-				       struct vm_area_struct *vma2,
+static void try_to_merge_with_tree_page(struct rmap_item *item1,
+				       struct rmap_item *item2,
 				       struct page *oldpage,
 				       struct page *tree_page,
 				       int *success1,
@@ -1690,6 +1833,8 @@ static void try_to_merge_with_tree_page(struct vm_area_struct *vma1,
 	spinlock_t *ptl1, *ptl2;
 	pte_t *ptep1, *ptep2;
 	unsigned long addr1, addr2;
+	struct vm_area_struct *vma1 = item1->slot->vma;
+	struct vm_area_struct *vma2 = item2->slot->vma;
 
 	*success1 = 0;
 	*success2 = 0;
@@ -1699,15 +1844,19 @@ static void try_to_merge_with_tree_page(struct vm_area_struct *vma1,
 		goto success_both;
 	}
 
-	if (!PageAnon(oldpage)) {
+	if (!PageAnon(oldpage) || !PageKsm(oldpage)) {
 		goto failed;
 	}
 
-	/* be ware, we cannot take nested pte locks,
+	/* If the oldpage is still ksm and still pointed
+	 * to in the right place, and still write protected,
+	 * we are confident it's not changed, no need to
+	 * memcmp anymore.
+	 * be ware, we cannot take nested pte locks,
 	 * deadlock risk.
 	 */
 	addr1 = page_address_in_vma(oldpage, vma1);
-	if (addr1 == -EFAULT)
+	if (addr1 == -EFAULT || addr1 != item1->address)
 		goto failed;
 
 	ptep1 = page_check_address(oldpage, vma1->vm_mm, addr1, &ptl1, 0);
@@ -1737,7 +1886,7 @@ static void try_to_merge_with_tree_page(struct vm_area_struct *vma1,
 
 	/* ok, then vma2, remind that pte1 already set */
 	addr2 = page_address_in_vma(oldpage, vma2);
-	if (addr2 == -EFAULT) {
+	if (addr2 == -EFAULT || addr2 != item2->address) {
 		goto success1;
 	}
 
@@ -1825,14 +1974,14 @@ static struct stable_node *stable_node_roll(struct stable_node *snode)
  */
 static struct stable_node *
 stable_tree_insert(struct page *kpage, u32 checksum_val,
-		   struct vm_area_struct *vma1, struct vm_area_struct *vma2,
+		   struct rmap_item *item1, struct rmap_item *item2,
 		   int *success1, int *success2)
 {
 	struct rb_node **new = &root_stable_tree.rb_node;
 	struct rb_node *parent = NULL;
-	struct stable_node *stable_node, *new_stable_node, *colli_node, *start_node;
+	struct stable_node *stable_node, *new_stable_node, *colli_node, *start_node, *save_node;
 	unsigned long tmp;
-	int collision = 0;
+	int collision = 0, retry = 0;
 
 	while (*new) {
 		struct page *tree_page;
@@ -1904,17 +2053,21 @@ stable_tree_insert(struct page *kpage, u32 checksum_val,
 
 				put_page(tree_page);
 
+				save_node = stable_node;
 				stable_node = stable_node_roll(stable_node);
-				if (!stable_node || stable_node == start_node) {
+				if (!stable_node || stable_node == start_node || retry) {
 					/*
 					 * this is the only node or we
 					 * have checked all these nodes,
 					 * fail out.
 					 */
+					if (!stable_node)
+						stable_node = save_node;
+
 					collision = 1;
 					goto create_new;
 				}
-
+				retry = 1;
 				goto repeat_collision;
 			}
 
@@ -1923,7 +2076,7 @@ stable_tree_insert(struct page *kpage, u32 checksum_val,
 			 * We have both the rmap_items' mmap_sem already locked
 			 * and the page gotten and locked and , easy to do the job.
 			 */
-			try_to_merge_with_tree_page(vma1, vma2, kpage,
+			try_to_merge_with_tree_page(item1, item2, kpage,
 						    tree_page, success1,
 						    success2);
 			put_page(tree_page);
@@ -2168,21 +2321,30 @@ node_vma_ok: /* ok, ready to add to the list */
 }
 
 
+//#define DEBUG_KSM_PAGE 1
+
 /*
- * Insert new_item to the collision list of tree_item
+ * Insert new_item to the collision list, _after_ tree_item
  * replace the tree_item on the rb_node
  */
 static inline void rmap_collision_insert(struct rmap_item *new_item,
-					     struct rmap_item *tree_item)
+					 struct rmap_item *tree_item)
 {
 	BUG_ON(!rmap_item_is_rbnode(tree_item));
-	list_add(&new_item->collision, tree_item->collision.prev);
+	list_add(&new_item->collision, &tree_item->collision);
 	rb_replace_node(&tree_item->node, &new_item->node,
 			&root_unstable_tree);
 
 	new_item->address |= UNSTABLE_FLAG;
 	new_item->append_round = ksm_scan_round;
 	tree_item->node.rb_parent_color = 0;
+#ifdef DEBUG_KSM_PAGE
+	if (!strcmp(new_item->slot->vma->vm_mm->owner->comm, "best_case")) {
+		printk(KERN_ERR "KSM: new_item(%s)->addr=%p tree_item(%s)->addr=%p\n",
+		       new_item->slot->vma->vm_mm->owner->comm, (void*)new_item->address,
+		       tree_item->slot->vma->vm_mm->owner->comm, (void*)tree_item->address);
+	}
+#endif
 }
 
 /*
@@ -2203,8 +2365,7 @@ static void cmp_and_merge_page(struct rmap_item *rmap_item)
 	struct page *kpage = NULL;
 	u32 checksum_val;
 	int err;
-	unsigned int same_page, success1, success2;
-
+	unsigned int same_page, success1, success2, retry;
 	struct stable_node *snode, *scolli_node, *snode_start;
 
 	remove_rmap_item_from_tree(rmap_item);
@@ -2219,7 +2380,11 @@ static void cmp_and_merge_page(struct rmap_item *rmap_item)
 	snode = stable_tree_search(page, checksum_val);
 	if (snode) {
 		snode_start = NULL;
-
+		retry = 0;
+	/* If collision happens, we roll the collision wheel letting each
+	 * node have a chance to be _memcmp_ed, but we shall fail after
+	 * retrying another time to speed up the increase of sample num.
+	 */
 	repeat_collision:
 		/* search the collision list for a valid page */
 		while (snode) {
@@ -2243,7 +2408,6 @@ static void cmp_and_merge_page(struct rmap_item *rmap_item)
 			 * replaced by its collision node.
 			 */
 			snode = scolli_node;
-
 		}
 
 		if (kpage) {
@@ -2278,12 +2442,13 @@ static void cmp_and_merge_page(struct rmap_item *rmap_item)
 				 */
 
 				snode = stable_node_roll(snode);
-				if (snode && snode != snode_start) {
+				if (snode && snode != snode_start && !retry) {
 					/*
 					 * It still has an collision next node
 					 * and it's not the start point, we
 					 * trun back and try again.
 					 */
+					retry = 1;
 					goto repeat_collision;
 					//return;
 				}
@@ -2315,7 +2480,7 @@ stable_search_failed:
 		unstable_tree_search_insert(rmap_item, page, checksum_val);
 	if (tree_rmap_item) {
 		tree_item_start = NULL;
-
+		retry = 0;
 repeat_rmap_collision:
 		while (tree_rmap_item) {
 			err = get_tree_rmap_item_page(tree_rmap_item,
@@ -2371,8 +2536,8 @@ repeat_rmap_collision:
 			remove_rmap_item_from_tree(tree_rmap_item);
 			lock_page(kpage);
 			snode = stable_tree_insert(kpage, checksum_val,
-						tree_rmap_item->slot->vma,
-						rmap_item->slot->vma,
+						tree_rmap_item,
+						rmap_item,
 						&success1, &success2);
 			unlock_page(kpage);
 
@@ -2400,9 +2565,16 @@ repeat_rmap_collision:
 			 * search other possible collision nodes
 			 */
 			up_read(&tree_rmap_item->slot->vma->vm_mm->mmap_sem);
+
+			if (retry) {
+				rmap_collision_insert(rmap_item, tree_rmap_item);
+				return;
+			}
+
 			rmap_item_saved = tree_rmap_item;
 			tree_rmap_item = unstable_rmap_roll(tree_rmap_item);
-			if (!tree_rmap_item || tree_rmap_item == tree_item_start) {
+			if (!tree_rmap_item ||
+			    tree_rmap_item == tree_item_start) {
 				/*
 				 * this is the only node or we
 				 * have checked all these nodes,
@@ -2414,6 +2586,7 @@ repeat_rmap_collision:
 						      tree_rmap_item);
 				return;
 			}
+			retry = 1;
 			goto repeat_rmap_collision;
 		}
 
