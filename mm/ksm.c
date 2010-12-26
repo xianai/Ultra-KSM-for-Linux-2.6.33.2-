@@ -148,15 +148,15 @@ static unsigned long ksm_stable_nodes;
 static unsigned long ksm_scan_batch_pages = 100;
 
 /* Milliseconds ksmd should sleep between batches */
-static unsigned int ksm_thread_sleep_millisecs = 20;
+static unsigned int ksm_thread_sleep_jiffies = 2;
 
 static unsigned long stable_tree_sample_num;
 
 
-#define KSM_SCAN_RATIO_MAX	1000000
+#define KSM_SCAN_RATIO_MAX	100
 
 /* minimum scan ratio for a vma, in unit of millionth */
-static unsigned int ksm_min_scan_ratio = 50000;
+static unsigned int ksm_min_scan_ratio = 5;
 
 /* Inter vma duplication number table page pointer array, initialized at startup */
 #define KSM_DUP_VMA_MAX		2048
@@ -178,6 +178,7 @@ static unsigned int ksm_scan_ladder_size;
 
 static unsigned long ksm_vma_slot_num = 0;
 
+static u64 ksm_sleep_times = 0;
 
 #define KSM_RUN_STOP	0
 #define KSM_RUN_MERGE	1
@@ -3105,7 +3106,7 @@ static inline int judge_rshash_direction(void)
 
 	current_neg_ratio = get_current_neg_ratio();
 
-	if (!current_neg_ratio)
+	if (current_neg_ratio < 10)
 		return GO_DOWN;
 
 	if (current_neg_ratio > 90)
@@ -3376,6 +3377,7 @@ static inline void rshash_adjust(void)
 	rshash_neg = rshash_pos = calsum_count = 0;
 
 	if (prev_sample_num != current_sample_num) {
+		printk(KERN_ERR "KSM: rehash stable tree\n");
 		stable_tree_delta_hash(prev_sample_num);
 	}
 }
@@ -3757,8 +3759,8 @@ static int ksm_scan_thread(void *nothing)
 		mutex_unlock(&ksm_thread_mutex);
 
 		if (ksmd_should_run()) {
-			schedule_timeout_interruptible(
-				msecs_to_jiffies(ksm_thread_sleep_millisecs));
+			schedule_timeout_interruptible(ksm_thread_sleep_jiffies);
+			ksm_sleep_times++;
 		} else {
 			wait_event_interruptible(ksm_thread_wait,
 				ksmd_should_run() || kthread_should_stop());
@@ -4047,7 +4049,7 @@ static int ksm_memory_callback(struct notifier_block *self,
 static ssize_t sleep_millisecs_show(struct kobject *kobj,
 				    struct kobj_attribute *attr, char *buf)
 {
-	return sprintf(buf, "%u\n", ksm_thread_sleep_millisecs);
+	return sprintf(buf, "%u\n", jiffies_to_msecs(ksm_thread_sleep_jiffies));
 }
 
 static ssize_t sleep_millisecs_store(struct kobject *kobj,
@@ -4061,7 +4063,10 @@ static ssize_t sleep_millisecs_store(struct kobject *kobj,
 	if (err || msecs > UINT_MAX)
 		return -EINVAL;
 
-	ksm_thread_sleep_millisecs = msecs;
+	ksm_thread_sleep_jiffies = msecs_to_jiffies(msecs);
+	printk(KERN_INFO "KSM: sleep interval changed to %u jiffies\n",
+	       ksm_thread_sleep_jiffies);
+
 
 	return count;
 }
@@ -4208,6 +4213,19 @@ static ssize_t pages_scanned_show(struct kobject *kobj,
 }
 KSM_ATTR_RO(pages_scanned);
 
+static ssize_t current_sample_num_show(struct kobject *kobj,
+				  struct kobj_attribute *attr, char *buf)
+{
+	return sprintf(buf, "%lu\n", current_sample_num);
+}
+KSM_ATTR_RO(current_sample_num);
+
+static ssize_t sleep_times_show(struct kobject *kobj,
+				  struct kobj_attribute *attr, char *buf)
+{
+	return sprintf(buf, "%llu\n", ksm_sleep_times);
+}
+KSM_ATTR_RO(sleep_times);
 
 
 static struct attribute *ksm_attrs[] = {
@@ -4221,6 +4239,8 @@ static struct attribute *ksm_attrs[] = {
 	&full_scans_attr.attr,
 	&min_scan_ratio_attr.attr,
 	&pages_scanned_attr.attr,
+	&current_sample_num_attr.attr,
+	&sleep_times_attr.attr,
 	NULL,
 };
 
@@ -4290,7 +4310,7 @@ static inline int cal_positive_negative_costs(void)
 	}
 	checksum_cost = 100 * (jiffies - time_start);
 	rshash_cost = checksum_cost / RANDOM_NUM_SIZE;
-	//printk(KERN_INFO "KSM: checksum_cost = %lu.\n", rshash_cost);
+	printk(KERN_INFO "KSM: checksum_cost = %lu.\n", rshash_cost);
 	current_sample_num = sample_num_stored;
 
 	time_start = jiffies;
@@ -4298,7 +4318,7 @@ static inline int cal_positive_negative_costs(void)
 		pages_identical(p1, p2);
 	}
 	memcmp_cost = 100 * (jiffies - time_start);
-	//printk(KERN_INFO "KSM: memcmp_cost = %lu.\n", memcmp_cost);
+	printk(KERN_INFO "KSM: memcmp_cost = %lu.\n", memcmp_cost);
 	gcdval = gcd(rshash_cost, memcmp_cost);
 	rshash_cost /= gcdval;
 	memcmp_cost /= gcdval;
