@@ -91,7 +91,7 @@ struct scan_rung {
 	struct list_head *current_scan;
 	unsigned int pages_to_scan;
 	unsigned char round_finished; /* rung is ready for the next round */
-	unsigned char fully_scanned_slots;
+	unsigned long fully_scanned_slots;
 	unsigned long scan_ratio;
 	unsigned long vma_num;
 	//unsigned long vma_finished;
@@ -188,7 +188,6 @@ struct node_vma {
  * @hlist: link into hlist of rmap_items hanging off that stable_node
  */
 struct rmap_item {
-	//struct anon_vma *anon_vma;	/* when stable */
 	struct list_head collision; /* hash collision list */
 	struct vma_slot *slot;
 	unsigned long address;	/* + low bits used for flags below */
@@ -199,7 +198,10 @@ struct rmap_item {
 	/* Which rung scan turn it was last scanned */
 	//unsigned long last_scan;
 	unsigned long entry_index;
-	u32 checksum_val;	/* when unstable */
+	union {
+		u32 checksum_val;	/* when unstable, should not be ref after two unstable pages have been merged. */
+		struct anon_vma *anon_vma;	/* when stable */
+	};
 	union {
 		struct rb_node node;	/* when node of unstable tree */
 		struct {		/* when listed from stable tree's node_vma */
