@@ -1706,7 +1706,7 @@ static int try_to_merge_two_pages(struct rmap_item *rmap_item,
 //			 orig_pte2, wprt_pte2);
 restore1_out:
 	lock_page(page);
-	if (!restore_ksm_page_pte(vma1, rmap_item->address & PAGE_MASK,
+	if (!restore_ksm_page_pte(vma1, get_rmap_addr(rmap_item),
 				  orig_pte1, wprt_pte1)) {
 		page->mapping = saved_mapping;
 	}
@@ -1867,9 +1867,7 @@ static void try_to_merge_with_tree_page(struct rmap_item *item1,
 	 * be ware, we cannot take nested pte locks,
 	 * deadlock risk.
 	 */
-	addr1 = page_address_in_vma(oldpage, vma1);
-	if (addr1 == -EFAULT || addr1 != item1->address)
-		goto failed;
+	addr1 = get_rmap_addr(item1);
 
 	ptep1 = page_check_address(oldpage, vma1->vm_mm, addr1, &ptl1, 0);
 	if (!ptep1)
@@ -1897,10 +1895,7 @@ static void try_to_merge_with_tree_page(struct rmap_item *item1,
 
 
 	/* ok, then vma2, remind that pte1 already set */
-	addr2 = page_address_in_vma(oldpage, vma2);
-	if (addr2 == -EFAULT || addr2 != item2->address) {
-		goto success1;
-	}
+	addr2 = get_rmap_addr(item2);
 
 	ptep2 = page_check_address(oldpage, vma2->vm_mm, addr2, &ptl2, 0);
 	if (!ptep2)
@@ -3148,10 +3143,10 @@ static inline void vma_rung_enter(struct vma_slot *slot,
 
 
 
-/*
+
 	printk(KERN_ERR "KSM: %s enter ladder %d vma=%x dedup=%lu\n",
 	       slot->vma->vm_mm->owner->comm, (rung - &ksm_scan_ladder[0]), (unsigned int)slot->vma, slot->dedup_ratio);
-*/
+
 
 	BUG_ON(rung->current_scan == &rung->vma_list && !list_empty(&rung->vma_list));
 
