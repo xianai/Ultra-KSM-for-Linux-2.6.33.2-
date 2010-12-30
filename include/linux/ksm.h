@@ -143,6 +143,19 @@ struct ksm_checksum {
 	u32 val;
 };
 
+
+/**
+ * node of either the stable or unstale rbtree
+ *
+ */
+struct tree_node {
+	struct rb_node node; /* link in the main (un)stable rbtree */
+	struct rb_root sub_root; /* rb_root for sublevel collision rbtree */
+	u32 checksum_val;
+	unsigned long count; /* how many sublevel tree nodes */
+};
+
+
 /**
  * struct stable_node - node of the stable rbtree
  * @node: rb node of this ksm page in the stable tree
@@ -151,15 +164,18 @@ struct ksm_checksum {
  */
 struct stable_node {
 	//unsigned long status; /* is it in rb tree or in a collision list ?*/
-	struct rb_node node;
-	struct list_head collision; /* hash collision list */
+	struct rb_node node; /* link in sub-tree */
+	struct tree_node *tree_node; /* it's tree node root in stable tree */
 	struct hlist_head hlist;
 	unsigned long kpfn;
 	//struct ksm_checksum checksum;
-	u32 checksum_val;
+	u32 checksum_full; /* != 0 iff it has collisions */
 	//struct vm_area_struct *old_vma;
 	struct list_head all_list; /* in a list for all stable nodes */
 };
+
+
+
 
 /**
  * struct node_vma - group rmap_items linked in a same stable
@@ -188,10 +204,9 @@ struct node_vma {
  * @hlist: link into hlist of rmap_items hanging off that stable_node
  */
 struct rmap_item {
-	struct list_head collision; /* hash collision list */
 	struct vma_slot *slot;
-	unsigned long address;	/* + low bits used for flags below */
 	struct page *page;
+	unsigned long address;	/* + low bits used for flags below */
 	/* Appendded to (un)stable tree on which scan round */
 	unsigned long append_round;
 
@@ -199,14 +214,15 @@ struct rmap_item {
 	//unsigned long last_scan;
 	unsigned long entry_index;
 	union {
-		u32 checksum_val;	/* when unstable, should not be ref after two unstable pages have been merged. */
-		struct anon_vma *anon_vma;	/* when stable */
-	};
-	union {
-		struct rb_node node;	/* when node of unstable tree */
-		struct {		/* when listed from stable tree's node_vma */
+		struct {/* when in unstable tree */
+			struct rb_node node;
+			struct tree_node *tree_node;
+			u32 checksum_full;
+		};
+		struct { /* when in stable tree */
 			struct node_vma *head;
 			struct hlist_node hlist;
+			struct anon_vma *anon_vma;
 		};
 	};
 } __attribute__((aligned(4)));
