@@ -2348,6 +2348,7 @@ static inline void rmap_collision_insert(struct rmap_item *new_item,
 
 	new_item->address |= UNSTABLE_FLAG;
 	new_item->append_round = ksm_scan_round;
+	new_item->node.rb_parent_color = 0;
 //	tree_item->node.rb_parent_color = 0;
 	ksm_pages_round_collision++;
 
