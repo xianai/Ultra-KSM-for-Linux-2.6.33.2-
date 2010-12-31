@@ -2492,6 +2492,23 @@ static inline void rmap_collision_insert(struct rmap_item *new_item,
 #endif
 }
 
+
+static inline u32 rmap_item_full_hash(struct rmap_item *item)
+{
+	u32 checksum_full;
+
+	if (item->address & FULL_HASH_FLAG) {
+		checksum_full = item->checksum_full;
+	} else {
+		checksum_full = calc_checksum_full(item->page, 1);
+		item->checksum_full = checksum_full;
+		item->address |= FULL_HASH_FLAG;
+	}
+
+	return checksum_full;
+}
+
+
 /*
  * cmp_and_merge_page - first see if page can be merged into the stable tree;
  * if not, compare checksum to previous and if it's the same, see if page can
@@ -2508,11 +2525,11 @@ static void cmp_and_merge_page(struct rmap_item *rmap_item)
 	struct page *page, *tree_page = NULL;
 	//struct stable_node *stable_node;
 	struct page *kpage = NULL;
-	u32 checksum_val;
+	u32 checksum_val, checksum_full;
 	int err;
 	unsigned int success1, success2;
 	struct stable_node *snode;
-	int same_page = 0;
+	int same_page = 0, cmp;
 
 	remove_rmap_item_from_tree(rmap_item, 1);
 
@@ -2595,46 +2612,33 @@ static void cmp_and_merge_page(struct rmap_item *rmap_item)
 				break_cow(tree_rmap_item);
 			}
 
-
-			/*
-			 * If we fail to insert the page into the stable tree,
-			 * we will have 2 virtual addresses that are pointing
-			 * to a ksm page left outside the stable tree,
-			 * in which case we need to break_cow on both.
-			 */
-
-
 		} else if (err == MERGE_ERR_COLLI) {
-			/* it's only a hash collision,
-			 * search other possible collision nodes
-			 */
-			//up_read(&tree_rmap_item->slot->vma->vm_mm->mmap_sem);
+			if (tree_rmap_item->tree_node->count == 1) {
+				rmap_item_full_hash(tree_rmap_item);
 
-/*
-			if (retry) {
-				rmap_collision_insert(rmap_item, tree_rmap_item);
-				return;
-			}
-*/
-			rmap_collision_insert(rmap_item, tree_rmap_item);
-			rmap_item_saved = unstable_rmap_roll(tree_rmap_item);
-			BUG_ON(!rmap_item_saved);
-/*
-			if (!tree_rmap_item ||
-			    tree_rmap_item == tree_item_start) {
-				if (!tree_rmap_item)
-					tree_rmap_item = rmap_item_saved;
-				rmap_collision_insert(rmap_item,
-						      tree_rmap_item);
-				return;
-			}
-			retry = 1;
-			goto repeat_rmap_collision;
-*/
+				if (rmap_item->address & FULL_HASH_FLAG) {
+					checksum_full = rmap_item->checksum_full;
+				} else {
+					checksum_full = calc_checksum_full(tree_rmap_item->page, 1);
+					rmap_item->checksum_full = checksum_full;
+					rmap_item->address |= FULL_HASH_FLAG;
+				}
+			} else
+				BUG_ON(!(rmap_item->address & FULL_HASH_FLAG));
+			cmp = checksum_cmp(checksum_full, tree_rmap_item->checksum_full);
+			parent = *new;
+			if (cmp < 0) {
+				new = &parent->rb_left;
+			} else if (cmp > 0) {
+				new = &parent->rb_right;
+			} else
+				goto get_page_out;
+
+
 		}
 
 
-		put_page(tree_page);
+		put_page(tree_rmap_item->page);
 
 up_out:
 		up_read(&tree_rmap_item->slot->vma->vm_mm->mmap_sem);
