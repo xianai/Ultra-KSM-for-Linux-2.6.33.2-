@@ -110,16 +110,14 @@ int memcmpx86 (void *__s1, void *__s2, size_t __n)
 
 #define UNSTABLE_FLAG	0x1	/* is a node of the unstable tree */
 #define STABLE_FLAG	0x2	/* is listed from the stable tree */
-#define FULL_HASH_FLAG  0x4	/* is it fully hashed ?*/
+//#define FULL_HASH_FLAG  0x4	/* is it fully hashed ?*/
 
 #define IS_ADDR_FLAG	1
 #define is_addr(ptr)		((unsigned long)(ptr) & IS_ADDR_FLAG)
 #define set_is_addr(ptr)	((ptr) |= IS_ADDR_FLAG)
 #define get_clean_addr(ptr)	(((ptr) & ~(__typeof__(ptr))IS_ADDR_FLAG ))
 
-/* The stable and unstable tree heads */
-static struct rb_root root_stable_tree = RB_ROOT;
-static struct rb_root root_unstable_tree = RB_ROOT;
+
 
 
 static struct kmem_cache *rmap_item_cache;
@@ -172,7 +170,7 @@ static unsigned int ksm_vma_table_size = 2048;
 static unsigned long ksm_vma_table_num = 0;
 static unsigned long ksm_vma_table_index_end = 0;
 
-static unsigned long ksm_scan_round = 1;
+static unsigned long long ksm_scan_round = 1;
 
 /* How fast the scan ratio is changed */
 static unsigned int ksm_scan_ratio_delta = 5;
@@ -198,7 +196,27 @@ struct list_head vma_slot_noadd = LIST_HEAD_INIT(vma_slot_noadd);
 struct list_head vma_slot_del = LIST_HEAD_INIT(vma_slot_del);
 static DEFINE_SPINLOCK(vma_slot_list_lock);
 
+/* The stable and unstable tree heads */
+static struct rb_root root_unstable_tree = RB_ROOT;
 static struct list_head stable_node_list = LIST_HEAD_INIT(stable_node_list);/* all stable nodes */
+
+/* This is a list for stable nodes that can cause two level hash collision,
+ * but with different page content, this should be really rare.
+ * But if it really happens, this is the place they should go.
+ */
+static struct list_head stable_node_hell = LIST_HEAD_INIT(stable_node_hell);
+static struct list_head unstable_tree_node_list = LIST_HEAD_INIT(unstable_tree_node_list);
+
+
+/* We use two groups of structs to speed up the rehashing of stable tree */
+static struct list_head
+stable_tree_node_list[2] = {LIST_HEAD_INIT(stable_tree_node_list[0]),
+			    LIST_HEAD_INIT(stable_tree_node_list[1])};
+
+static struct list_head *stable_tree_node_listp = &stable_tree_node_list[0];
+static struct rb_root root_stable_tree[2] = {RB_ROOT, RB_ROOT};
+static struct rb_root *root_stable_treep = &root_stable_tree[0];
+unsigned long stable_tree_index = 0;
 
 
 
@@ -388,20 +406,21 @@ static inline void free_stable_node(struct stable_node *stable_node)
 	kmem_cache_free(stable_node_cache, stable_node);
 }
 
-static inline struct tree_node *alloc_tree_node(void)
+static inline struct tree_node *alloc_tree_node(struct list_head *list)
 {
 	struct tree_node *node;
-	node = kmem_cache_alloc(tree_node_cache, GFP_KERNEL | GFP_ATOMIC);
+	node = kmem_cache_zalloc(tree_node_cache, GFP_KERNEL | GFP_ATOMIC);
 	if (!node)
 		return NULL;
 
 	node->sub_root = RB_ROOT;
-	//node->count = 1; /* immediately followed by an add */
+	list_add(&node->all_list, list);
 	return node;
 }
 
 static inline void free_tree_node(struct tree_node *node)
 {
+	list_del(&node->all_list);
 	kmem_cache_free(tree_node_cache, node);
 }
 
@@ -546,12 +565,6 @@ static void ksm_intertab_clear(struct vma_slot *slot)
 
 }
 
-static inline int stable_node_is_rbnode(struct stable_node *snode)
-{
-	return (rb_parent(&snode->node) || root_stable_tree.rb_node == &snode->node);
-}
-
-
 /*
  * Returns the next collision node that has replaced this node,
  * returns NULL if it has no collision.
@@ -561,8 +574,6 @@ static void remove_node_from_stable_tree(struct stable_node *stable_node)
 	struct node_vma *node_vma;
 	struct rmap_item *rmap_item;
 	struct hlist_node *hlist, *rmap_hlist, *n;
-
-	struct stable_node *newnode = NULL;
 
 	if (!hlist_empty(&stable_node->hlist)) {
 		hlist_for_each_entry_safe(node_vma, hlist, n,
@@ -645,7 +656,7 @@ static void remove_node_from_stable_tree(struct stable_node *stable_node)
 */
 	rb_erase(&stable_node->node, &stable_node->tree_node->sub_root);
 	if (RB_EMPTY_ROOT(&stable_node->tree_node->sub_root)) {
-		rb_erase(&stable_node->tree_node->node, &root_stable_tree);
+		rb_erase(&stable_node->tree_node->node, root_stable_treep);
 		free_tree_node(stable_node->tree_node);
 	} else
 		stable_node->tree_node->count--;
@@ -687,7 +698,6 @@ static struct page *get_ksm_page(struct stable_node *stable_node)
 {
 	struct page *page;
 	void *expected_mapping;
-	struct stable_node *newnode;
 
 	page = pfn_to_page(stable_node->kpfn);
 	expected_mapping = (void *)stable_node +
@@ -715,8 +725,7 @@ stale:
  * return the next hash collision rmap_item if possible, otherwise NULL
  */
 static
-struct rmap_item *remove_rmap_item_from_tree(struct rmap_item *rmap_item,
-					     int clear_full_hash)
+struct rmap_item *remove_rmap_item_from_tree(struct rmap_item *rmap_item)
 {
 	struct rmap_item *next_item = NULL;
 
@@ -727,7 +736,7 @@ struct rmap_item *remove_rmap_item_from_tree(struct rmap_item *rmap_item,
 
 		node_vma = rmap_item->head;
 		stable_node = node_vma->head;
-		page = get_ksm_page(stable_node, NULL);
+		page = get_ksm_page(stable_node);
 		if (!page)
 			goto out;
 
@@ -741,15 +750,18 @@ struct rmap_item *remove_rmap_item_from_tree(struct rmap_item *rmap_item,
 			free_node_vma(node_vma);
 		}
 
-		if (hlist_empty(&stable_node->hlist))
+		if (hlist_empty(&stable_node->hlist)) {
+			/* do NOT call remove_node_from_stable_tree() here,
+			 * it's possible for a forked rmap_item not in
+			 * stable tree while the in-tree rmap_items were
+			 * deleted.
+			 */
 			ksm_pages_shared--;
-		else
+		} else
 			ksm_pages_sharing--;
 
 
 		drop_anon_vma(rmap_item);
-		rmap_item->address &= PAGE_MASK;
-
 	} else if (rmap_item->address & UNSTABLE_FLAG) {
 		//unsigned char age;
 
@@ -764,27 +776,19 @@ struct rmap_item *remove_rmap_item_from_tree(struct rmap_item *rmap_item,
 //		BUG_ON(age > 1);
 //		if (!age)
 		if (rmap_item->append_round == ksm_scan_round) {
-			if (rmap_item_is_rbnode(rmap_item)) {
-				if (!list_empty(&rmap_item->collision)) {
-					next_item = next_rmap_colli(rmap_item);
-					rb_replace_node(&rmap_item->node,
-							&next_item->node,
-							&root_unstable_tree);
-					list_del_init(&rmap_item->collision);
-				} else
-					rb_erase(&rmap_item->node,
-						 &root_unstable_tree);
-				rmap_item->node.rb_parent_color = 0;
-			} else if (!list_empty(&rmap_item->collision))
-				list_del_init(&rmap_item->collision);
+			rb_erase(&rmap_item->node, &rmap_item->tree_node->sub_root);
+			if (RB_EMPTY_ROOT(&rmap_item->tree_node->sub_root)) {
+				rb_erase(&rmap_item->tree_node->node, &root_unstable_tree);
+				free_tree_node(rmap_item->tree_node);
+			} else
+				rmap_item->tree_node->count--;
 		}
 		ksm_pages_unshared--;
-		if (rmap_item->address & FULL_HASH_FLAG && !clear_full_hash) {
-			rmap_item->address &= PAGE_MASK;
-			rmap_item->address |= FULL_HASH_FLAG;
-		} else
-			rmap_item->address &= PAGE_MASK;
 	}
+
+	rmap_item->address &= PAGE_MASK;
+	rmap_item->checksum_full = 0;
+
 out:
 	cond_resched();		/* we're called from many long loops */
 	return next_item;
@@ -1167,11 +1171,12 @@ static int unmerge_ksm_pages(struct vm_area_struct *vma,
 #endif
 
 
-#define RANDOM_NUM_SIZE		(PAGE_SIZE / sizeof(u32))
+#define MAX_HASH_STRENGTH		(PAGE_SIZE / sizeof(u32))
+//#define RANDOM_NUM_SIZE		(PAGE_SIZE / sizeof(u32))
 static u32 *random_nums;
 
 /* the number of unsigned long to be taken */
-static unsigned long current_sample_num = RANDOM_NUM_SIZE >> 4;
+static unsigned long current_sample_num = MAX_HASH_STRENGTH >> 4;
 static unsigned long sample_num_delta = 0;
 #define SAMPLE_NUM_DELTA_MAX	5
 static u64 rshash_pos = 0;
@@ -1215,7 +1220,7 @@ static struct {
 
 static u32 random_sample_hash(void *addr, u32 sample_num)
 {
-        u32 hash = 0;
+        u32 hash = 0xdeadbeef;
         u32 index, pos;
         u32 *key = (u32*)addr;
 
@@ -1247,7 +1252,7 @@ static inline u32 calc_checksum(struct page *page, int cost_accounting)
 		/* it's sucessfully identified by random sampling
 		 * hash, so increase the positive count.
 		 */
-		rshash_pos += rshash_cost * (RANDOM_NUM_SIZE - current_sample_num);
+		rshash_pos += rshash_cost * (MAX_HASH_STRENGTH - current_sample_num);
 		BUG_ON(tmp > rshash_pos);
 		calsum_count++;
 	}
@@ -1770,6 +1775,71 @@ static inline void checksum_copy2(u32 val, struct ksm_checksum *node_checksum)
 	return;
 }
 
+
+static u32 delta_hash(void *addr, u32 from, u32 to, u32 hash)
+{
+	u32 *key = (u32*)addr;
+	u32 index, pos;
+
+	if (to > from) {
+		for (index = from; index < to; index++) {
+			pos = random_nums[index];
+			hash += key[pos];
+			hash += (hash << 19);
+			hash ^= (hash >> 16);
+		}
+
+	} else {
+		for (index = from - 1; index >= to; index--) {
+			hash ^= (hash >> 16);
+			hash -= (hash << 19);
+			pos = random_nums[index];
+			hash -= key[pos];
+		}
+
+	}
+
+	return hash;
+}
+
+
+/*
+ * return a non-zero hash value.
+ */
+static inline u32 calc_checksum_full(struct page *page, u32 checksum_old)
+{
+	u32 checksum_full = 0;
+	void *addr;
+
+	addr = kmap_atomic(page, KM_USER0);
+	checksum_full = delta_hash(addr, current_sample_num,
+				   MAX_HASH_STRENGTH, checksum_old);
+
+	kunmap_atomic(addr, KM_USER0);
+
+	if (!checksum_full)
+		checksum_full = 1;
+
+	return checksum_full;
+}
+
+
+
+static inline u32 rmap_item_full_hash(struct rmap_item *item, u32 checksum_val)
+{
+	u32 checksum_full = item->checksum_full;
+
+	if (!checksum_full) {
+		checksum_full = calc_checksum_full(item->page, checksum_val);
+
+		item->checksum_full = checksum_full;
+	}
+
+	return checksum_full;
+}
+
+
+
 /*
  * stable_tree_search - search for page inside the stable tree
  * if return == NULL and *stable_node != NULL, it's a forked page, the stable_node is found
@@ -1779,7 +1849,7 @@ static inline void checksum_copy2(u32 val, struct ksm_checksum *node_checksum)
  */
 static struct page *stable_tree_search(struct rmap_item *item, u32 checksum_val)
 {
-	struct rb_node *node = root_stable_tree.rb_node;
+	struct rb_node *node = root_stable_treep->rb_node;
 	struct tree_node *rnode;
 	unsigned long checksum_full;
 	struct page *page = item->page;
@@ -1815,7 +1885,7 @@ static struct page *stable_tree_search(struct rmap_item *item, u32 checksum_val)
 
 	if (rnode->count == 1) {
 		stable_node = rb_entry(rnode->sub_root.rb_node,
-					struct stable_node, node);
+				       struct stable_node, node);
 		BUG_ON(!stable_node);
 
 		goto get_page_out;
@@ -1826,13 +1896,7 @@ static struct page *stable_tree_search(struct rmap_item *item, u32 checksum_val)
 	 */
 	node = rnode->sub_root.rb_node;
 	BUG_ON(!node);
-	if (item->address & FULL_HASH_FLAG) {
-		checksum_full = item->checksum_full;
-	} else {
-		checksum_full = calc_checksum_full(page, 1);
-		item->checksum_full = checksum_full;
-		item->address |= FULL_HASH_FLAG;
-	}
+	checksum_full = rmap_item_full_hash(item, checksum_val);
 
 	while (node) {
 		int cmp;
@@ -1855,20 +1919,6 @@ get_page_out:
 	page = get_ksm_page(stable_node);
 	return page;
 }
-
-
-
-static inline void stable_collision_insert(struct stable_node *new_node,
-					   struct stable_node *tree_node)
-{
-	BUG_ON(!stable_node_is_rbnode(tree_node));
-	list_add(&new_node->collision, tree_node->collision.prev);
-	rb_replace_node(&tree_node->node, &new_node->node,
-			&root_stable_tree);
-
-	tree_node->node.rb_parent_color = 0;
-}
-
 
 /*
  * oldpage is already locked.
@@ -1986,30 +2036,21 @@ failed:
 	return;
 }
 
-/**
- * If it has no collision node, return NULL, else make the next
- * collision node the tree node and return it.
- *
- *
- * @return struct stable_node*
+
+
+/* We remap the full hash value 0 to 1
+ * 0 is used for a tag that this hash value is not initialized.
  */
-static struct stable_node *stable_node_roll(struct stable_node *snode)
+static inline void stable_node_full_hash(struct stable_node *node,
+					struct page *page, u32 checksum_val)
 {
-	struct stable_node *scolli_node;
+	u32 checksum_full = node->checksum_full;
 
-	if (list_empty(&snode->collision))
-		return NULL;
-
-	scolli_node = list_entry(snode->collision.next,
-		     struct stable_node, collision);
-	rb_replace_node(&snode->node, &scolli_node->node,
-			&root_stable_tree);
-	snode->node.rb_parent_color = 0;
-
-	return scolli_node;
+	if (!checksum_full) {
+		checksum_full = calc_checksum_full(page, checksum_val);
+		node->checksum_full = checksum_full;
+	}
 }
-
-
 
 /*
  * stable_tree_insert - insert rmap_item pointing to new ksm page
@@ -2024,16 +2065,13 @@ stable_tree_insert(struct page *kpage, u32 checksum_val,
 		   struct rmap_item *tree_rmap_item,
 		   int *success1, int *success2)
 {
-	struct rb_node **new = &root_stable_tree.rb_node;
+	struct rb_node **new = &root_stable_treep->rb_node;
 	struct rb_node *parent = NULL;
-	struct stable_node *stable_node, *new_stable_node, *colli_node, *start_node, *save_node;
-	struct tree_node *rnode, *new_rnode;
-	unsigned long tmp;
-	int collision = 0, retry = 0;
+	struct stable_node *stable_node, *new_stable_node;
+	struct tree_node *rnode;
 	struct page *tree_page;
-	u32 checksum_full;
+	u32 checksum_full = 0;
 	int cmp;
-	struct rb_root *sub_root = NULL;
 
 	*success1 = *success2 = 0;
 
@@ -2076,13 +2114,7 @@ stable_tree_insert(struct page *kpage, u32 checksum_val,
 		new = &rnode->sub_root.rb_node;
 		parent = NULL;
 		BUG_ON(!*new);
-		if (rmap_item->address & FULL_HASH_FLAG) {
-			checksum_full = rmap_item->checksum_full;
-		} else {
-			checksum_full = calc_checksum_full(kpage, 1);
-			rmap_item->checksum_full = checksum_full;
-			rmap_item->address |= FULL_HASH_FLAG;
-		}
+		checksum_full = rmap_item_full_hash(rmap_item, checksum_val);
 		while (*new) {
 			int cmp;
 
@@ -2097,7 +2129,7 @@ stable_tree_insert(struct page *kpage, u32 checksum_val,
 				parent = *new;
 				new = &parent->rb_right;
 			} else {
-				tree_page = get_ksm_page(stable_node)
+				tree_page = get_ksm_page(stable_node);
 				if (tree_page)
 					goto cmp_pages;
 				else {
@@ -2111,43 +2143,37 @@ stable_tree_insert(struct page *kpage, u32 checksum_val,
 
 	/* no tree node found */
 new_tree_node:
-	rnode = alloc_tree_node();
+	rnode = alloc_tree_node(stable_tree_node_listp);
 	if (!rnode)
 		goto failed;
 	else {
+		rnode->checksum_val = checksum_val;
 		rb_link_node(&rnode->node, parent, new);
-		rb_insert_color(&rnode->node, &root_stable_tree);
+		rb_insert_color(&rnode->node, root_stable_treep);
 
 		/* prepare for stable node insertion */
 		parent = NULL;
-		new = &rnode->sub_root.rb_node
+		new = &rnode->sub_root.rb_node;
 		goto new_stable_node_direct;
 	}
 
 cmp_pages:
-	ret = memcmp_pages(kpage, tree_page); //write_protect_page
+	cmp = memcmp_pages(kpage, tree_page); //write_protect_page
 
 
-	if (ret) {
+	if (cmp) {
 		/* it's only a hash collision, if it only happens in the first
 		 * level, we insert it in the sub-tree with full hash,
 		 * otherwise, we fail out.
 		 */
 		if (stable_node->tree_node->count == 1)
-			stable_node->checksum_full = calc_checksum_full(tree_page, 1);
+			stable_node_full_hash(stable_node, tree_page,
+					      stable_node->tree_node->checksum_val);
 
 		put_page(tree_page);
 
 new_stable_node:
-		if (rmap_item->address & FULL_HASH_FLAG &&
-		    stable_node->checksum_full !=
-		    rmap_item->checksum_full) {
-			checksum_full = rmap_item->checksum_full;
-		} else {
-			checksum_full = calc_checksum_full(kpage, 1);
-			rmap_item->checksum_full = checksum_full;
-			rmap_item->address |= FULL_HASH_FLAG;
-		}
+		checksum_full = rmap_item_full_hash(rmap_item, checksum_val);
 		cmp = checksum_cmp(checksum_full, stable_node->checksum_full);
 		parent = &stable_node->node;
 		if (cmp < 0) {
@@ -2163,13 +2189,13 @@ new_stable_node_direct:
 			goto failed;
 
 		new_stable_node->kpfn = page_to_pfn(kpage);
-		new_stable_node->checksum_full = checksum_val;
+		new_stable_node->checksum_full = checksum_full;
 		new_stable_node->tree_node = rnode;
 		set_page_stable_node(kpage, new_stable_node);
 
 		rb_link_node(&new_stable_node->node, parent, new);
 		rb_insert_color(&new_stable_node->node, &rnode->sub_root);
-		rnode->tree_node->count++;
+		rnode->count++;
 		*success1 = *success2 = 1;
 		return new_stable_node;
 
@@ -2212,13 +2238,11 @@ struct rmap_item *unstable_tree_search_insert(struct rmap_item *rmap_item,
 
 {
 	struct rb_node **new = &root_unstable_tree.rb_node;
-	struct rb_node **tree_node_new = NULL;
-	struct rb_node *parent = NULL, *tree_node_parent = NULL;
+	struct rb_node *parent = NULL;
 	struct tree_node *rnode;
-	struct unstable_node *unstable_node;
 	u32 checksum_full;
 	struct rmap_item *tree_rmap_item;
-	struct page *page = rmap_item->page;
+	//struct page *page = rmap_item->page;
 
 	while (*new) {
 		//struct rmap_item *tree_rmap_item;
@@ -2250,18 +2274,9 @@ struct rmap_item *unstable_tree_search_insert(struct rmap_item *rmap_item,
 		}
 
 		/* well, search the collision subtree */
-		*new = &rnode->sub_root.rb_node;
+		new = &rnode->sub_root.rb_node;
 		BUG_ON(!*new);
-		//checksum_full = calc_checksum_full(page, 1);
-		//rmap_item->checksum_full = checksum_full;
-		if (rmap_item->address & FULL_HASH_FLAG) {
-			checksum_full = rmap_item->checksum_full;
-		} else {
-			checksum_full = calc_checksum_full(page, 1);
-			rmap_item->checksum_full = checksum_full;
-			rmap_item->address |= FULL_HASH_FLAG;
-		}
-
+		checksum_full = rmap_item_full_hash(rmap_item, checksum_val);
 
 		while (*new) {
 			int cmp;
@@ -2279,7 +2294,7 @@ struct rmap_item *unstable_tree_search_insert(struct rmap_item *rmap_item,
 		}
 	} else {
 		/* alloc a new tree_node */
-		rnode = alloc_tree_node();
+		rnode = alloc_tree_node(&unstable_tree_node_list);
 		if (!rnode)
 			return NULL;
 
@@ -2287,8 +2302,7 @@ struct rmap_item *unstable_tree_search_insert(struct rmap_item *rmap_item,
 		rb_link_node(&rnode->node, parent, new);
 		rb_insert_color(&rnode->node, &root_unstable_tree);
 		parent = NULL;
-		new = &rnode->sub_root.rb_node
-
+		new = &rnode->sub_root.rb_node;
 	}
 
 	/* did not found even in sub-tree */
@@ -2463,52 +2477,6 @@ node_vma_ok: /* ok, ready to add to the list */
 }
 
 
-//#define DEBUG_KSM_PAGE 1
-
-/*
- * Insert new_item to the collision list, _after_ tree_item
- * replace the tree_item on the rb_node
- */
-static inline void rmap_collision_insert(struct rmap_item *new_item,
-					 struct rmap_item *tree_item)
-{
-	BUG_ON(!rmap_item_is_rbnode(tree_item));
-	list_add(&new_item->collision, &tree_item->collision);
-//	rb_replace_node(&tree_item->node, &new_item->node,
-//			&root_unstable_tree);
-
-	new_item->address |= UNSTABLE_FLAG;
-	new_item->append_round = ksm_scan_round;
-	new_item->node.rb_parent_color = 0;
-//	tree_item->node.rb_parent_color = 0;
-	ksm_pages_round_collision++;
-
-#ifdef DEBUG_KSM_PAGE
-	if (!strcmp(new_item->slot->vma->vm_mm->owner->comm, "best_case")) {
-		printk(KERN_ERR "KSM: new_item(%s)->addr=%p tree_item(%s)->addr=%p\n",
-		       new_item->slot->vma->vm_mm->owner->comm, (void*)new_item->address,
-		       tree_item->slot->vma->vm_mm->owner->comm, (void*)tree_item->address);
-	}
-#endif
-}
-
-
-static inline u32 rmap_item_full_hash(struct rmap_item *item)
-{
-	u32 checksum_full;
-
-	if (item->address & FULL_HASH_FLAG) {
-		checksum_full = item->checksum_full;
-	} else {
-		checksum_full = calc_checksum_full(item->page, 1);
-		item->checksum_full = checksum_full;
-		item->address |= FULL_HASH_FLAG;
-	}
-
-	return checksum_full;
-}
-
-
 /*
  * cmp_and_merge_page - first see if page can be merged into the stable tree;
  * if not, compare checksum to previous and if it's the same, see if page can
@@ -2520,9 +2488,8 @@ static inline u32 rmap_item_full_hash(struct rmap_item *item)
  */
 static void cmp_and_merge_page(struct rmap_item *rmap_item)
 {
-	struct rmap_item *tree_rmap_item, *tree_colli_item, *rmap_item_saved;
-	struct rmap_item *tree_item_start;
-	struct page *page, *tree_page = NULL;
+	struct rmap_item *tree_rmap_item;
+	struct page *page;
 	//struct stable_node *stable_node;
 	struct page *kpage = NULL;
 	u32 checksum_val, checksum_full;
@@ -2530,8 +2497,9 @@ static void cmp_and_merge_page(struct rmap_item *rmap_item)
 	unsigned int success1, success2;
 	struct stable_node *snode;
 	int same_page = 0, cmp;
+	struct rb_node *parent = NULL, **new;
 
-	remove_rmap_item_from_tree(rmap_item, 1);
+	remove_rmap_item_from_tree(rmap_item);
 
 	page = rmap_item->page;
 	checksum_val = calc_checksum(page, 1);
@@ -2591,7 +2559,7 @@ static void cmp_and_merge_page(struct rmap_item *rmap_item)
 			update_intertab_unstable(rmap_item, tree_rmap_item);
 */
 			kpage = page;
-			remove_rmap_item_from_tree(tree_rmap_item, 0);
+			remove_rmap_item_from_tree(tree_rmap_item);
 			lock_page(kpage);
 			snode = stable_tree_insert(kpage, checksum_val,
 						   rmap_item, tree_rmap_item,
@@ -2614,27 +2582,25 @@ static void cmp_and_merge_page(struct rmap_item *rmap_item)
 
 		} else if (err == MERGE_ERR_COLLI) {
 			if (tree_rmap_item->tree_node->count == 1) {
-				rmap_item_full_hash(tree_rmap_item);
-
-				if (rmap_item->address & FULL_HASH_FLAG) {
-					checksum_full = rmap_item->checksum_full;
-				} else {
-					checksum_full = calc_checksum_full(tree_rmap_item->page, 1);
-					rmap_item->checksum_full = checksum_full;
-					rmap_item->address |= FULL_HASH_FLAG;
-				}
+				rmap_item_full_hash(tree_rmap_item,
+				tree_rmap_item->tree_node->checksum_val);
 			} else
-				BUG_ON(!(rmap_item->address & FULL_HASH_FLAG));
+				BUG_ON(!(tree_rmap_item->checksum_full));
+			checksum_full = rmap_item_full_hash(rmap_item, checksum_val);
 			cmp = checksum_cmp(checksum_full, tree_rmap_item->checksum_full);
-			parent = *new;
+			parent = &tree_rmap_item->node;
 			if (cmp < 0) {
 				new = &parent->rb_left;
 			} else if (cmp > 0) {
 				new = &parent->rb_right;
 			} else
-				goto get_page_out;
+				goto up_out;
 
-
+			rmap_item->tree_node = tree_rmap_item->tree_node;
+			rmap_item->address |= UNSTABLE_FLAG;
+			rmap_item->append_round = ksm_scan_round;
+			rb_link_node(&rmap_item->node, parent, new);
+			rb_insert_color(&rmap_item->node, &tree_rmap_item->tree_node->sub_root);
 		}
 
 
@@ -3279,8 +3245,8 @@ static unsigned long cal_dedup_ratio_clear(struct vma_slot *slot)
 static inline void inc_current_sample_num(unsigned long delta)
 {
 	current_sample_num += 1 << delta;
-	if (current_sample_num > RANDOM_NUM_SIZE)
-		current_sample_num = RANDOM_NUM_SIZE;
+	if (current_sample_num > MAX_HASH_STRENGTH)
+		current_sample_num = MAX_HASH_STRENGTH;
 	//printk(KERN_ERR "KSM: current_sample_num inc to %lu\n", current_sample_num);
 }
 
@@ -3362,99 +3328,180 @@ out1:
 	return STILL;
 }
 
-static u32 delta_hash(void *addr, u32 from, u32 to, u32 hash)
+static inline void stable_node_reinsert(struct stable_node *new_node,
+					struct page *page,
+					struct rb_root *root_treep,
+					struct list_head *tree_node_listp,
+					u32 checksum_val)
 {
-	u32 *key = (u32*)addr;
-	u32 index, pos;
-
-	if (to > from) {
-		for (index = from; index < to; index++) {
-			pos = random_nums[index];
-			hash += key[pos];
-			hash += (hash << 19);
-			hash ^= (hash >> 16);
-		}
-
-	} else {
-		for (index = from - 1; index >= to; index--) {
-			hash ^= (hash >> 16);
-			hash -= (hash << 19);
-			pos = random_nums[index];
-			hash -= key[pos];
-		}
-
-	}
-
-	return hash;
-}
-
-static inline void stable_node_reinsert(struct stable_node *node)
-{
-	struct rb_node **new = &root_stable_tree.rb_node;
+	struct rb_node **new = &root_treep->rb_node;
 	struct rb_node *parent = NULL;
 	struct stable_node *stable_node;
-	//unsigned long tmp;
+	struct tree_node *rnode;
+	struct page *tree_page;
+	int cmp;
 
 	while (*new) {
-		//struct page *tree_page;
+		//struct rmap_item *tree_rmap_item;
+		//
 		int cmp;
 
-		//cond_resched();
-		stable_node = rb_entry(*new, struct stable_node, node);
+		rnode = rb_entry(*new, struct tree_node, node);
 
-		//ret = memcmp_pages(kpage, tree_page);
-		//cmp = checksum_cmp_update(checksum_val, &stable_node->checksum,
-		//			  stable_node, &early_exit);
+		cmp = checksum_cmp(checksum_val, rnode->checksum_val);
 
-		cmp = checksum_cmp(node->checksum_val,
-				   stable_node->checksum_val);
-
-		parent = *new;
-		if (cmp < 0)
+		if (cmp < 0) {
+			parent = *new;
 			new = &parent->rb_left;
-		else if (cmp > 0)
+		} else if (cmp > 0) {
+			parent = *new;
 			new = &parent->rb_right;
-		else {
-			/*
-			 * Hash collision found!
-			 */
-			list_add(&node->collision, &stable_node->collision);
-			return;
-		}
+		} else
+			break;
 	}
 
-	rb_link_node(&node->node, parent, new);
-	rb_insert_color(&node->node, &root_stable_tree);
+	if (*new) {
+		/* find a stable tree node with same first level hash value */
+		stable_node_full_hash(new_node, page, checksum_val);
+		if (rnode->count == 1) {
+			stable_node = rb_entry(rnode->sub_root.rb_node,
+					       struct stable_node, node);
+			tree_page = get_ksm_page(stable_node);
+			if (tree_page) {
+				stable_node_full_hash(stable_node,
+						      tree_page, checksum_val);
+				put_page(tree_page);
+
+				/* prepare for stable node insertion */
+
+				cmp = checksum_cmp(new_node->checksum_full,
+						   stable_node->checksum_full);
+				parent = &stable_node->node;
+				if (cmp < 0) {
+					new = &parent->rb_left;
+				} else if (cmp > 0) {
+					new = &parent->rb_right;
+				} else
+					goto failed;
+
+				goto add_node;
+			} else {
+				/* the only stable_node deleted, the tree node
+				 * was also deleted.
+				 */
+				goto new_tree_node;
+			}
+		}
+
+		/* well, search the collision subtree */
+		new = &rnode->sub_root.rb_node;
+		parent = NULL;
+		BUG_ON(!*new);
+		while (*new) {
+			int cmp;
+
+			stable_node = rb_entry(*new, struct stable_node, node);
+
+			cmp = checksum_cmp(new_node->checksum_full,
+					   stable_node->checksum_full);
+
+			if (cmp < 0) {
+				parent = *new;
+				new = &parent->rb_left;
+			} else if (cmp > 0) {
+				parent = *new;
+				new = &parent->rb_right;
+			} else {
+				/* oh, no, still a collision */
+				goto failed;
+			}
+		}
+
+		goto add_node;
+	}
+
+	/* no tree node found */
+new_tree_node:
+	rnode = alloc_tree_node(tree_node_listp);
+	if (!rnode) {
+		printk(KERN_ERR "KSM: memory allocation error!\n");
+		goto failed;
+	} else {
+		rnode->checksum_val = checksum_val;
+		rb_link_node(&rnode->node, parent, new);
+		rb_insert_color(&rnode->node, root_stable_treep);
+
+		/* prepare for stable node insertion */
+		parent = NULL;
+		new = &rnode->sub_root.rb_node;
+	}
+
+add_node:
+	rb_link_node(&new_node->node, parent, new);
+	rb_insert_color(&new_node->node, &rnode->sub_root);
+	rnode->count++;
+	return;
+
+failed:
+	/* This can only happen when two nodes have collided
+	 * in two levels, move them to the hell list.
+	 */
+	list_add(&new_node->hell_node, &stable_node_hell);
+	return;
+}
+
+static inline void free_all_tree_nodes(struct list_head *list)
+{
+	struct tree_node *node, *tmp;
+
+	list_for_each_entry_safe(node, tmp, list, all_list) {
+		free_tree_node(node);
+	}
 }
 
 static inline void stable_tree_delta_hash(u32 prev_sample_num)
 {
 	struct stable_node *node, *tmp;
+	struct rb_root *root_new_treep;
+	struct list_head *new_tree_node_listp;
 
-	root_stable_tree = RB_ROOT;
+	stable_tree_index = (stable_tree_index + 1) % 2;
+	root_new_treep = &root_stable_tree[stable_tree_index];
+	new_tree_node_listp = &stable_tree_node_list[stable_tree_index];
+	*root_new_treep = RB_ROOT;
+	BUG_ON(!list_empty(new_tree_node_listp));
+
+	/* we need to be safe, the node could be removed by get_ksm_page()
+	 * or by stable_node_reinsert() to hell list.
+	 */
 	list_for_each_entry_safe(node, tmp, &stable_node_list, all_list) {
 		void *addr;
 		struct page *node_page;
+		u32 checksum_val;
 
 		//node->status = STAT_NONE;
 		/* init the rbnode and collision list,
 		 * because it would be removed.
 		 */
-		node->node.rb_parent_color = 0;
-		INIT_LIST_HEAD(&node->collision);
-		node_page = get_ksm_page(node, NULL);
+		node_page = get_ksm_page(node);
 		if (!node_page)
 			continue;
 
 		addr = kmap_atomic(node_page, KM_USER0);
 
-		node->checksum_val = delta_hash(addr, prev_sample_num,
-						current_sample_num,
-						node->checksum_val);
+		checksum_val = delta_hash(addr, prev_sample_num,
+					  current_sample_num,
+					  node->tree_node->checksum_val);
 		kunmap_atomic(addr, KM_USER0);
+		stable_node_reinsert(node, node_page, root_new_treep,
+				     new_tree_node_listp, checksum_val);
 		put_page(node_page);
-		stable_node_reinsert(node);
 	}
+
+	root_stable_treep = root_new_treep;
+	free_all_tree_nodes(stable_tree_node_listp);
+	BUG_ON(!list_empty(stable_tree_node_listp));
+	stable_tree_node_listp = new_tree_node_listp;
 }
 
 static inline void rshash_adjust(void)
@@ -3868,6 +3915,7 @@ busy:
 		/* sync with ksm_remove_vma for rb_erase */
 		ksm_scan_round++;
 		root_unstable_tree = RB_ROOT;
+		free_all_tree_nodes(&unstable_tree_node_list);
 	}
 	cal_ladder_pages_to_scan(ksm_scan_batch_pages);
 }
@@ -4222,7 +4270,7 @@ static struct stable_node *ksm_check_stable_tree(unsigned long start_pfn,
 {
 	struct rb_node *node;
 
-	for (node = rb_first(&root_stable_tree); node; node = rb_next(node)) {
+	for (node = rb_first(root_stable_treep); node; node = rb_next(node)) {
 		struct stable_node *stable_node;
 
 		stable_node = rb_entry(node, struct stable_node, node);
@@ -4434,7 +4482,7 @@ KSM_ATTR_RO(pages_volatile);
 static ssize_t full_scans_show(struct kobject *kobj,
 			       struct kobj_attribute *attr, char *buf)
 {
-	return sprintf(buf, "%lu\n", ksm_scan_round);
+	return sprintf(buf, "%llu\n", ksm_scan_round);
 }
 KSM_ATTR_RO(full_scans);
 
@@ -4532,16 +4580,16 @@ static inline int cal_positive_negative_costs(void)
 	kunmap_atomic(addr2, KM_USER1);
 	kunmap_atomic(addr1, KM_USER0);
 
-	current_sample_num = RANDOM_NUM_SIZE;
+	current_sample_num = MAX_HASH_STRENGTH;
 	time_start = jiffies;
-	while (jiffies - time_start < RANDOM_NUM_SIZE / 10) {
+	while (jiffies - time_start < MAX_HASH_STRENGTH / 10) {
 		for (i = 0; i < 100; i++) {
 			calc_checksum(p1, 0);
 		}
 		loopnum += 100;
 	}
 	checksum_cost = 100 * (jiffies - time_start);
-	rshash_cost = checksum_cost / RANDOM_NUM_SIZE;
+	rshash_cost = checksum_cost / MAX_HASH_STRENGTH;
 	printk(KERN_INFO "KSM: checksum_cost = %lu.\n", rshash_cost);
 	current_sample_num = sample_num_stored;
 
@@ -4567,13 +4615,13 @@ static inline int init_random_sampling(void)
 	if (!random_nums)
 		return -ENOMEM;
 
-	for (i = 0; i < RANDOM_NUM_SIZE; i++)
+	for (i = 0; i < MAX_HASH_STRENGTH; i++)
 		random_nums[i] = i;
 
-	for (i = 0; i < RANDOM_NUM_SIZE; i++) {
+	for (i = 0; i < MAX_HASH_STRENGTH; i++) {
 		unsigned long rand_range, swap_index, tmp;
 
-		rand_range = RANDOM_NUM_SIZE - i;
+		rand_range = MAX_HASH_STRENGTH - i;
 		swap_index = random32() % rand_range;
 		tmp = random_nums[i];
 		random_nums[i] =  random_nums[swap_index];

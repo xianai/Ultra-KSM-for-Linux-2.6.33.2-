@@ -153,6 +153,7 @@ struct tree_node {
 	struct rb_root sub_root; /* rb_root for sublevel collision rbtree */
 	u32 checksum_val;
 	unsigned long count; /* how many sublevel tree nodes */
+	struct list_head all_list; /* all tree nodes in stable/unstable tree */
 };
 
 
@@ -163,8 +164,10 @@ struct tree_node {
  * @kpfn: page frame number of this ksm page
  */
 struct stable_node {
-	//unsigned long status; /* is it in rb tree or in a collision list ?*/
-	struct rb_node node; /* link in sub-tree */
+	union {
+		struct rb_node node; /* link in sub-rbtree */
+		struct list_head hell_node;
+	};
 	struct tree_node *tree_node; /* it's tree node root in stable tree */
 	struct hlist_head hlist;
 	unsigned long kpfn;
