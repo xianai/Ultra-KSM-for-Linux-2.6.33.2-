@@ -168,11 +168,11 @@ struct stable_node {
 		struct rb_node node; /* link in sub-rbtree */
 		struct list_head hell_node;
 	};
-	struct tree_node *tree_node; /* it's tree node root in stable tree */
+	struct tree_node *tree_node; /* it's tree node root in stable tree, NULL if it's in hell list */
 	struct hlist_head hlist;
 	unsigned long kpfn;
 	//struct ksm_checksum checksum;
-	u32 checksum_full; /* != 0 iff it has collisions */
+	u32 checksum_full; /* if ==0 then it's not been calculated yet */
 	//struct vm_area_struct *old_vma;
 	struct list_head all_list; /* in a list for all stable nodes */
 };
