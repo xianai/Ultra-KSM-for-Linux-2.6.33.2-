@@ -164,10 +164,7 @@ struct tree_node {
  * @kpfn: page frame number of this ksm page
  */
 struct stable_node {
-	union {
-		struct rb_node node; /* link in sub-rbtree */
-		struct list_head hell_node;
-	};
+	struct rb_node node; /* link in sub-rbtree */
 	struct tree_node *tree_node; /* it's tree node root in stable tree, NULL if it's in hell list */
 	struct hlist_head hlist;
 	unsigned long kpfn;
