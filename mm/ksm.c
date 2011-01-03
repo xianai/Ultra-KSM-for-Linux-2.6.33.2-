@@ -155,8 +155,14 @@ static unsigned long ksm_scan_batch_pages = 60000;
 /* Milliseconds ksmd should sleep between batches */
 static unsigned int ksm_thread_sleep_jiffies = 2;
 
+static unsigned int ksm_thrash_detect = 0;
+
 static unsigned long stable_tree_sample_num;
 
+/* To avoid the float point arithmetic, this is the scale of a
+ * deduplication ratio number.
+ */
+#define KSM_DEDUP_RATIO_SCALE	100
 
 #define KSM_SCAN_RATIO_MAX	125
 
@@ -229,28 +235,6 @@ unsigned long slots_enter_interval = 10;
 /* The jiffiy when last ksm_enter_all_slots was run */
 unsigned long slots_enter_last = 0;
 
-struct vma_slot {
-	struct list_head ksm_list;
-	struct list_head slot_list;
-	unsigned long dedup_ratio;
-	int ksm_index; /* -1 if vma is not in inter-table,
-				positive otherwise */
-	unsigned long pages_scanned;
-	unsigned long last_scanned;
-	unsigned char need_sort;
-	unsigned char need_rerand;
-	unsigned long pages_to_scan;
-	struct scan_rung *rung;
-	struct page **rmap_list_pool;
-	unsigned long *pool_counts;
-	unsigned long pool_size;
-	struct vm_area_struct *vma;
-	struct mm_struct *mm;
-	unsigned long ctime_j;
-	unsigned long pages;
-	unsigned long slot_scanned; /* It's scanned in this round */
-	unsigned long fully_scanned;
-};
 
 
 #define KSM_KMEM_CACHE(__struct, __flags) kmem_cache_create("ksm_"#__struct,\
@@ -2065,7 +2049,7 @@ static void try_to_merge_with_tree_page(struct rmap_item *item1,
 
 
 success_both:
-	printk(KERN_ERR "KSM: both success!\n");
+	//printk(KERN_ERR "KSM: both success!\n");
 	*success2 = 1;
 success1:
 	*success1 = 1;
@@ -2581,6 +2565,7 @@ node_vma_ok: /* ok, ready to add to the list */
 	hlist_add_head(&rmap_item->hlist, &node_vma->rmap_hlist);
 	node_vma->last_update = ksm_scan_round;
 	hold_anon_vma(rmap_item, rmap_item->slot->vma->anon_vma);
+	rmap_item->slot->pages_merged++;
 }
 
 
@@ -3305,7 +3290,8 @@ static unsigned long cal_dedup_ratio_clear(struct vma_slot *slot)
 {
 	int i;
 	unsigned long dedup_num = 0, pages1 = slot->pages, scanned1;
-	unsigned index;
+	unsigned int index;
+	unsigned long ret;
 
 	if (!slot->pages_scanned)
 		return 0;
@@ -3353,7 +3339,21 @@ static unsigned long cal_dedup_ratio_clear(struct vma_slot *slot)
 		dedup_num += ksm_inter_vma_table[index] * pages1 / scanned1;
 	//ksm_inter_vma_table[index] = 0;
 
-	return (dedup_num * KSM_SCAN_RATIO_MAX / pages1);
+	ret = (dedup_num * KSM_DEDUP_RATIO_SCALE / pages1);
+	if (ksm_thrash_detect) {
+		printk(KERN_ERR "KSM: worst_case dedup=%lu pages_merged=%lu pages_cowed=%lu",
+		       ret, slot->pages_merged, slot->pages_cowed);
+		if (slot->pages_cowed >= slot->pages_merged)
+			ret = 0;
+		else
+			ret = ret * (slot->pages_merged -
+				     slot->pages_cowed) / slot->pages_merged;
+		if (!strcmp(slot->vma->vm_mm->owner->comm, "worst_case")) {
+			printk(KERN_ERR "KSM: worst_case dedup=%lu", ret);
+		}
+	}
+
+	return ret;
 }
 
 static inline void inc_current_sample_num(unsigned long delta)
@@ -3811,7 +3811,7 @@ static void round_update_ladder(void)
 	int i;
 	struct vma_slot *slot, *tmp_slot;
 	unsigned long dedup_ratio_max = 0, dedup_ratio_mean = 0;
-	unsigned long threshold;
+	unsigned long threshold, thrash_thresh;
 	struct list_head tmp_list;
 
 	for (i = 0; i < ksm_vma_table_index_end; i++) {
@@ -3825,6 +3825,12 @@ static void round_update_ladder(void)
 
 	dedup_ratio_mean /= ksm_vma_slot_num;
 	threshold = dedup_ratio_mean;
+
+	if (ksm_thrash_detect) {
+		thrash_thresh = ksm_thrash_detect * KSM_DEDUP_RATIO_SCALE / 100;
+		threshold = thrash_thresh > threshold ?
+			    thrash_thresh : threshold;
+	}
 
 	for (i = 0; i < ksm_vma_table_index_end; i++) {
 		if ((slot = ksm_vma_table[i])) {
@@ -3883,6 +3889,8 @@ static void round_update_ladder(void)
 			//slot->pages_scanned = 0;
 			slot->last_scanned = slot->pages_scanned;
 			slot->slot_scanned = 0;
+			slot->pages_cowed = 0;
+			slot->pages_merged = 0;
 			if (slot->fully_scanned) {
 				slot->fully_scanned = 0;
 				ksm_scan_ladder[i].fully_scanned_slots--;
@@ -4558,6 +4566,10 @@ static ssize_t scan_batch_pages_store(struct kobject *kobj,
 }
 KSM_ATTR(scan_batch_pages);
 
+
+
+
+
 static ssize_t run_show(struct kobject *kobj, struct kobj_attribute *attr,
 			char *buf)
 {
@@ -4595,6 +4607,29 @@ static ssize_t run_store(struct kobject *kobj, struct kobj_attribute *attr,
 	return count;
 }
 KSM_ATTR(run);
+
+
+static ssize_t thrash_detect_show(struct kobject *kobj,
+				  struct kobj_attribute *attr,char *buf)
+{
+	return sprintf(buf, "%u\n", ksm_thrash_detect);
+}
+
+static ssize_t thrash_detect_store(struct kobject *kobj, struct kobj_attribute *attr,
+				   const char *buf, size_t count)
+{
+	int err;
+	unsigned long flags;
+
+	err = strict_strtoul(buf, 10, &flags);
+	if (err || flags > 99)
+		return -EINVAL;
+
+	ksm_thrash_detect = flags;
+
+	return count;
+}
+KSM_ATTR(thrash_detect);
 
 static ssize_t pages_shared_show(struct kobject *kobj,
 				 struct kobj_attribute *attr, char *buf)
@@ -4676,6 +4711,7 @@ static struct attribute *ksm_attrs[] = {
 	&pages_scanned_attr.attr,
 	&current_sample_num_attr.attr,
 	&sleep_times_attr.attr,
+	&thrash_detect_attr.attr,
 	NULL,
 };
 

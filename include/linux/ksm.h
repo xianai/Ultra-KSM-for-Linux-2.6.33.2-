@@ -98,6 +98,32 @@ struct scan_rung {
 	unsigned long scan_turn;
 };
 
+struct vma_slot {
+	struct list_head ksm_list;
+	struct list_head slot_list;
+	unsigned long dedup_ratio;
+	int ksm_index; /* -1 if vma is not in inter-table,
+				positive otherwise */
+	unsigned long pages_scanned;
+	unsigned long last_scanned;
+	unsigned long pages_to_scan;
+	struct scan_rung *rung;
+	struct page **rmap_list_pool;
+	unsigned long *pool_counts;
+	unsigned long pool_size;
+	struct vm_area_struct *vma;
+	struct mm_struct *mm;
+	unsigned long ctime_j;
+	unsigned long pages;
+	unsigned char need_sort;
+	unsigned char need_rerand;
+	unsigned long slot_scanned; /* It's scanned in this round */
+	unsigned long fully_scanned; /* the above four to be merged to status bits */
+	unsigned long pages_cowed; /* pages cowed this round */
+	unsigned long pages_merged; /* pages merged this round */
+};
+
+
 /*
  * A few notes about the KSM scanning process,
  * to make it easier to understand the data structures below:
