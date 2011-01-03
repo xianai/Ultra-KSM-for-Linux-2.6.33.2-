@@ -2313,7 +2313,7 @@ try_to_merge:
 				    tree_page, success1, success2);
 	put_page(tree_page);
 	if (!*success1 && !*success2) {
-		printk(KERN_ERR "KSM really the same failed\n");
+		//printk(KERN_ERR "KSM really the same failed\n");
 
 		goto failed;
 	} else
@@ -3801,7 +3801,7 @@ out:
 	rshash_neg = rshash_pos = 0;
 
 	if (prev_sample_num != current_sample_num) {
-		printk(KERN_ERR "KSM: rehash stable tree\n");
+		//printk(KERN_ERR "KSM: rehash stable tree\n");
 		stable_tree_delta_hash(prev_sample_num);
 	}
 }
@@ -4121,8 +4121,10 @@ static int ksm_vma_enter(struct vma_slot *slot)
 
 
 
+/*
 		printk(KERN_ERR "KSM: added task=%s vma=%x\n",
 		       slot->vma->vm_mm->owner->comm, (unsigned int)slot->vma);
+*/
 
 
 		BUG_ON(rung->current_scan == &rung->vma_list && !list_empty(&rung->vma_list));
