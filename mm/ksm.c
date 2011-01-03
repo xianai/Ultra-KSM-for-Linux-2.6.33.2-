@@ -3188,7 +3188,7 @@ out2:
 	put_page(rmap_item->page);
 out1:
 	//rmap_item->last_scan = slot->rung->scan_turn;
-	slot->rung->pages_to_scan--;
+	//slot->rung->pages_to_scan--;
 	slot->pages_scanned++;
 	slot->slot_scanned = 1;
 	if (vma_fully_scanned(slot)) {
@@ -3341,16 +3341,16 @@ static unsigned long cal_dedup_ratio_clear(struct vma_slot *slot)
 
 	ret = (dedup_num * KSM_DEDUP_RATIO_SCALE / pages1);
 	if (ksm_thrash_detect) {
-		printk(KERN_ERR "KSM: worst_case dedup=%lu pages_merged=%lu pages_cowed=%lu",
-		       ret, slot->pages_merged, slot->pages_cowed);
+		//printk(KERN_ERR "KSM: worst_case dedup=%lu pages_merged=%lu pages_cowed=%lu",
+		//       ret, slot->pages_merged, slot->pages_cowed);
 		if (slot->pages_cowed >= slot->pages_merged)
 			ret = 0;
 		else
 			ret = ret * (slot->pages_merged -
 				     slot->pages_cowed) / slot->pages_merged;
-		if (!strcmp(slot->vma->vm_mm->owner->comm, "worst_case")) {
-			printk(KERN_ERR "KSM: worst_case dedup=%lu", ret);
-		}
+		//if (!strcmp(slot->vma->vm_mm->owner->comm, "worst_case")) {
+		//	printk(KERN_ERR "KSM: worst_case dedup=%lu", ret);
+		//}
 	}
 
 	return ret;
@@ -3923,7 +3923,8 @@ static void inline cal_ladder_pages_to_scan(unsigned int num)
 		ksm_scan_ladder[i].pages_to_scan = num
 			* ksm_scan_ladder[i].scan_ratio / KSM_SCAN_RATIO_MAX;
 	}
-	ksm_scan_ladder[0].pages_to_scan /= 4;
+	ksm_scan_ladder[0].pages_to_scan /= 16;
+	ksm_scan_ladder[1].pages_to_scan /= 4;
 }
 
 
@@ -3936,27 +3937,41 @@ static void ksm_do_scan(void)
 	struct vma_slot *slot, *iter;
 	struct list_head *next_scan, *iter_head;
 	struct mm_struct *busy_mm;
-	unsigned char round_finished = 1, all_rungs_emtpy;
+	unsigned char round_finished, all_rungs_emtpy;
 	int i, err;
-	unsigned long rest_pages = 0;
+	unsigned long rest_pages;
+	//int all_pages_scanned = 1;
 
 	might_sleep();
 
+	rest_pages = 0;
+
+repeat_all:
 	for (i = ksm_scan_ladder_size - 1; i >= 0; i--) {
 		struct scan_rung *rung = &ksm_scan_ladder[i];
 
-		if (list_empty(&rung->vma_list))
+		if (!rung->pages_to_scan)
 			continue;
 
-		if (rung->fully_scanned_slots == rung->vma_num && !rung->fully_scanned_slots) {
-			rest_pages += rung->pages_to_scan;
+		if (list_empty(&rung->vma_list)) {
+			rung->pages_to_scan = 0;
 			continue;
 		}
+
+
+		if (rung->fully_scanned_slots == rung->vma_num
+		    && !rung->fully_scanned_slots) {
+			rest_pages += rung->pages_to_scan;
+			rung->pages_to_scan = 0;
+			continue;
+		}
+
 
 		rung->pages_to_scan += rest_pages;
 		rest_pages = 0;
 		while (rung->pages_to_scan) {
-//			int vma_busy = 0, n = 1;
+			rung->pages_to_scan--;
+
 cleanup:
 			cleanup_vma_slots();
 
@@ -4034,6 +4049,7 @@ busy:
 					BUG_ON(rung->current_scan == &rung->vma_list && !list_empty(&rung->vma_list));
 					if (rung->vma_num == rung->fully_scanned_slots) {
 						rest_pages += rung->pages_to_scan;
+						rung->pages_to_scan = 0;
 						break;
 						//printk(KERN_ERR "KSM: solo round finished !\n");
 						//goto pre_next_round;
@@ -4048,6 +4064,8 @@ busy:
 		}
 	}
 
+
+	round_finished = 1;
 	all_rungs_emtpy = 1;
 	for (i = 0; i < ksm_scan_ladder_size; i++) {
 		struct scan_rung *rung = &ksm_scan_ladder[i];
@@ -4075,6 +4093,17 @@ busy:
 		root_unstable_tree = RB_ROOT;
 		free_all_tree_nodes(&unstable_tree_node_list);
 	}
+
+	for (i = 0; i < ksm_scan_ladder_size; i++) {
+		struct scan_rung *rung = &ksm_scan_ladder[i];
+
+		/* consistent speed control for all size of vma */
+		if (!list_empty(&rung->vma_list) && rung->pages_to_scan) {
+			//printk(KERN_ERR " rung[%d]->pages_to_scan=%u", i, rung->pages_to_scan);
+			goto repeat_all;
+		}
+	}
+
 	cal_ladder_pages_to_scan(ksm_scan_batch_pages);
 }
 
