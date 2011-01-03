@@ -128,9 +128,11 @@ static struct kmem_cache *tree_node_cache;
 
 static unsigned long long ksm_pages_scanned = 0;
 
-static unsigned long long ksm_pages_round_scanned = 0;
+static unsigned long long ksm_pages_scanned_last = 0;
 
-static unsigned long long ksm_pages_round_collision = 0;
+//static unsigned long long ksm_pages_round_scanned = 0;
+
+//static unsigned long long ksm_pages_round_collision = 0;
 
 /* The number of nodes in the stable tree */
 static unsigned long ksm_pages_shared;
@@ -148,7 +150,7 @@ static unsigned long ksm_rmap_items;
 static unsigned long ksm_stable_nodes;
 
 /* Number of pages ksmd should scan in one batch, in ratio of millionth */
-static unsigned long ksm_scan_batch_pages = 100;
+static unsigned long ksm_scan_batch_pages = 60000;
 
 /* Milliseconds ksmd should sleep between batches */
 static unsigned int ksm_thread_sleep_jiffies = 2;
@@ -156,12 +158,12 @@ static unsigned int ksm_thread_sleep_jiffies = 2;
 static unsigned long stable_tree_sample_num;
 
 
-#define KSM_SCAN_RATIO_MAX	27
+#define KSM_SCAN_RATIO_MAX	125
 
 /* minimum scan ratio for a vma, in unit of percentage */
 static unsigned int ksm_min_scan_ratio = 1;
 
-static unsigned int ksm_scan_ratio_delta = 3;
+static unsigned int ksm_scan_ratio_delta = 5;
 
 /* Inter vma duplication number table page pointer array, initialized at startup */
 #define KSM_DUP_VMA_MAX		2048
@@ -1194,12 +1196,13 @@ static int unmerge_ksm_pages(struct vm_area_struct *vma,
 static u32 *random_nums;
 
 /* the number of unsigned long to be taken */
-static unsigned long current_sample_num = HASH_STRENGTH_MAX; //HASH_STRENGTH_FULL >> 4;
+static unsigned long current_sample_num = HASH_STRENGTH_FULL >> 4;
 static unsigned long sample_num_delta = 0;
 #define SAMPLE_NUM_DELTA_MAX	5
 static u64 rshash_pos = 0;
 static u64 rshash_neg = 0;
 static unsigned long  rshash_neg_cont_zero = 0;
+static unsigned long  rshash_cont_obscure = 0;
 //static unsigned long rshash_cost = 0;
 static unsigned long memcmp_cost = 0;
 
@@ -2608,7 +2611,7 @@ static void cmp_and_merge_page(struct rmap_item *rmap_item)
 	page = rmap_item->page;
 	checksum_val = calc_checksum(page, current_sample_num, 1);
 
-	ksm_pages_round_scanned++;
+	ksm_pages_scanned++;
 
 	/* We first start with searching the page inside the stable tree */
 	kpage = stable_tree_search(rmap_item, checksum_val);
@@ -3393,41 +3396,46 @@ static inline u64 get_current_benefit(void)
 	if (rshash_neg > rshash_pos)
 		return 0;
 
-	return div64_u64((rshash_pos - rshash_neg), ksm_pages_round_scanned);
+	return div64_u64((rshash_pos - rshash_neg),
+			 ksm_pages_scanned - ksm_pages_scanned_last);
 }
 
-
-
-
-/*
 static inline int judge_rshash_direction(void)
 {
 	u64 current_neg_ratio, stable_benefit;
 	u64 current_benefit, delta = 0;
-
-	if (ksm_scan_round & (unsigned long long)(1<<11 - 1) == 1)
-		return OBSCURE;
+	int ret;
 
 	current_neg_ratio = get_current_neg_ratio();
 
 	if (current_neg_ratio == 0) {
 		rshash_neg_cont_zero++;
-		if (rshash_neg_cont_zero > 2) {
-
+		if (rshash_neg_cont_zero > 2)
 			return GO_DOWN;
-		} else
+		else
 			return STILL;
-	} else
-		rshash_neg_cont_zero = 0;
+	}
+	rshash_neg_cont_zero = 0;
 
-	if (current_neg_ratio > 90)
-		return GO_UP;
+	if (current_neg_ratio > 90) {
+		ret = GO_UP;
+		goto out;
+	}
+
+	/* In case the system are still for a long time. */
+	if (ksm_scan_round % 1024 == 3) {
+		ret = OBSCURE;
+		goto out;
+	}
+
 
 	current_benefit = get_current_benefit();
 	stable_benefit = rshash_state.stable_benefit;
 
-	if (!stable_benefit)
-		goto out1;
+	if (!stable_benefit) {
+		ret = OBSCURE;
+		goto out;
+	}
 
 	if (current_benefit > stable_benefit)
 		delta = current_benefit - stable_benefit;
@@ -3437,19 +3445,24 @@ static inline int judge_rshash_direction(void)
 	delta = div64_u64(100 * delta , stable_benefit);
 
 	if (delta > 50) {
-out1:
-		return OBSCURE;
+		rshash_cont_obscure++;
+		if (rshash_cont_obscure > 2)
+			return OBSCURE;
+		else
+			return STILL;
 	}
 
+out:
+	rshash_cont_obscure = 0;
 	return STILL;
 }
-*/
 
+/*
 static inline int judge_rshash_direction(void)
 {
-	return GO_DOWN;
+	return GO_UP;
 }
-
+*/
 
 
 static inline void stable_node_reinsert(struct stable_node *new_node,
@@ -3640,7 +3653,7 @@ static inline void rshash_adjust(void)
 {
 	unsigned long prev_sample_num = current_sample_num;
 
-	if (!ksm_pages_round_scanned)
+	if (ksm_pages_scanned == ksm_pages_scanned_last)
 		return;
 
 /*
@@ -3883,9 +3896,10 @@ static void round_update_ladder(void)
 
 	rshash_adjust();
 
-	ksm_pages_scanned += ksm_pages_round_scanned;
-	ksm_pages_round_scanned = 0;
-	ksm_pages_round_collision = 0;
+	ksm_pages_scanned_last = ksm_pages_scanned;
+
+//	ksm_pages_round_scanned = 0;
+	//ksm_pages_round_collision = 0;
 }
 
 static inline unsigned int ksm_pages_to_scan(unsigned int batch_pages)
@@ -3901,8 +3915,7 @@ static void inline cal_ladder_pages_to_scan(unsigned int num)
 		ksm_scan_ladder[i].pages_to_scan = num
 			* ksm_scan_ladder[i].scan_ratio / KSM_SCAN_RATIO_MAX;
 	}
-
-	//ksm_scan_ladder[0].pages_to_scan = 20;
+	ksm_scan_ladder[0].pages_to_scan /= 4;
 }
 
 
@@ -4080,6 +4093,9 @@ static int ksm_vma_enter(struct vma_slot *slot)
 	struct scan_rung *rung;
 	unsigned long pages_to_scan, pool_size;
 
+//	if (strcmp(slot->vma->vm_mm->owner->comm, "back_ground"))
+//		return 0;
+
 	while (slot->pages != vma_pages(slot->vma)) spin_lock(&vma_slot_list_lock);
 	rung = &ksm_scan_ladder[0];
 	if ((pages_to_scan = get_vma_random_scan_num(slot, rung->scan_ratio))) {
@@ -4104,10 +4120,10 @@ static int ksm_vma_enter(struct vma_slot *slot)
 		BUG_ON(!slot->pool_counts);
 
 
-/*
+
 		printk(KERN_ERR "KSM: added task=%s vma=%x\n",
 		       slot->vma->vm_mm->owner->comm, (unsigned int)slot->vma);
-*/
+
 
 		BUG_ON(rung->current_scan == &rung->vma_list && !list_empty(&rung->vma_list));
 
@@ -4678,8 +4694,8 @@ static void inline init_scan_ladder(void)
 
 	for (i = 0; i < ksm_scan_ladder_size; i++, mul *= ksm_scan_ratio_delta) {
 		ksm_scan_ladder[i].scan_ratio = ksm_min_scan_ratio * mul;
-		ksm_scan_ladder[i].pages_to_scan = pages_to_scan
-			* ksm_scan_ladder[i].scan_ratio / KSM_SCAN_RATIO_MAX;
+//		ksm_scan_ladder[i].pages_to_scan = pages_to_scan
+//			* ksm_scan_ladder[i].scan_ratio / KSM_SCAN_RATIO_MAX;
 		INIT_LIST_HEAD(&ksm_scan_ladder[i].vma_list);
 		//init_MUTEX(&ksm_scan_ladder[i].sem);
 		ksm_scan_ladder[i].vma_num = 0;
@@ -4688,6 +4704,8 @@ static void inline init_scan_ladder(void)
 		ksm_scan_ladder[i].round_finished = 0;
 		ksm_scan_ladder[i].fully_scanned_slots = 0;
 	}
+
+	cal_ladder_pages_to_scan(ksm_scan_batch_pages);
 }
 
 static inline int cal_positive_negative_costs(void)
