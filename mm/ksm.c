@@ -3340,12 +3340,18 @@ static unsigned long cal_dedup_ratio_clear(struct vma_slot *slot)
 	//ksm_inter_vma_table[index] = 0;
 
 	ret = (dedup_num * KSM_DEDUP_RATIO_SCALE / pages1);
+	//if (ret > 100)
+	//	ret = 100;
+
 	if (ksm_thrash_detect) {
 		//printk(KERN_ERR "KSM: worst_case dedup=%lu pages_merged=%lu pages_cowed=%lu",
 		//       ret, slot->pages_merged, slot->pages_cowed);
 		if (slot->pages_cowed >= slot->pages_merged)
 			ret = 0;
-		else
+		else if (slot->pages_cowed * 100 / slot->pages_merged > ksm_thrash_detect) {
+			printk(KERN_ERR "KSM: thrash area %s, %p\n", slot->vma->vm_mm->owner->comm, slot->vma);
+			ret = 0;
+		} else
 			ret = ret * (slot->pages_merged -
 				     slot->pages_cowed) / slot->pages_merged;
 		//if (!strcmp(slot->vma->vm_mm->owner->comm, "worst_case")) {
@@ -3826,11 +3832,13 @@ static void round_update_ladder(void)
 	dedup_ratio_mean /= ksm_vma_slot_num;
 	threshold = dedup_ratio_mean;
 
+/*
 	if (ksm_thrash_detect) {
 		thrash_thresh = ksm_thrash_detect * KSM_DEDUP_RATIO_SCALE / 100;
 		threshold = thrash_thresh > threshold ?
 			    thrash_thresh : threshold;
 	}
+*/
 
 	for (i = 0; i < ksm_vma_table_index_end; i++) {
 		if ((slot = ksm_vma_table[i])) {
