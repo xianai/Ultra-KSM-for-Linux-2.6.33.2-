@@ -84,6 +84,7 @@ int rmap_walk_ksm(struct page *page, int (*rmap_one)(struct page *,
 		  struct vm_area_struct *, unsigned long, void *), void *arg);
 void ksm_migrate_page(struct page *newpage, struct page *oldpage);
 
+/* Each rung of this ladder is a list of VMAs having a same scan ratio */
 struct scan_rung {
 	struct list_head vma_list;
 	//spinlock_t vma_list_lock;
