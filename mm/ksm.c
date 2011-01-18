@@ -491,7 +491,6 @@ stale:
 /*
  * Removing rmap_item from stable or unstable tree.
  * This function will clean the information from the stable/unstable tree.
- * return the next hash collision rmap_item if possible, otherwise NULL
  */
 static inline void remove_rmap_item_from_tree(struct rmap_item *rmap_item)
 {
@@ -617,19 +616,14 @@ vma_page_address(struct page *page, struct vm_area_struct *vma)
 }
 
 /*
- * ksmd, and unmerge_and_remove_all_rmap_items(), must not touch an mm's
- * page tables after it has passed through ksm_exit() - which, if necessary,
- * takes mmap_sem briefly to serialize against them.  ksm_exit() does not set
- * a special flag: they can just back out as soon as mm_users goes to zero.
- * ksm_test_exit() is used throughout to make this test for exit: in some
- * places for correctness, in some places just to avoid unnecessary work.
+ * Test if the mm is exiting
  */
 static inline bool ksm_test_exit(struct mm_struct *mm)
 {
 	return atomic_read(&mm->mm_users) == 0;
 }
 
-/* return 0 on success with item's mmap_sem locked */
+/* return 0 on success with the item's mmap_sem locked */
 static inline int get_mergeable_page_lock_mmap(struct rmap_item *item)
 {
 	struct mm_struct *mm;
@@ -653,7 +647,6 @@ static inline int get_mergeable_page_lock_mmap(struct rmap_item *item)
 	vma = slot->vma;
 
 	if (ksm_test_exit(mm)) {
-		//err = -EINVAL;
 		goto failout_up;
 	}
 
@@ -677,6 +670,9 @@ failout_up:
 	return err;
 }
 
+/*
+ * What kind of VMA is considered ?
+ */
 static inline int vma_can_enter(struct vm_area_struct *vma)
 {
 	return !(vma->vm_flags & (VM_PFNMAP | VM_IO  | VM_DONTEXPAND |
@@ -685,7 +681,11 @@ static inline int vma_can_enter(struct vm_area_struct *vma)
 				 VM_SHARED  | VM_MAYSHARE ) );
 }
 
-/* must be done before linked to mm */
+/*
+ * Called whenever a fresh new vma is created A new vma_slot.
+ * is created and inserted into a global list Must be called.
+ * after vma is inserted to its mm      		    .
+ */
 inline void ksm_vma_add_new(struct vm_area_struct *vma)
 {
 	struct vma_slot *slot;
@@ -709,7 +709,9 @@ inline void ksm_vma_add_new(struct vm_area_struct *vma)
 	spin_unlock(&vma_slot_list_lock);
 }
 
-/* It must be done AFTER vma is unlinked from its mm */
+/*
+ * Called after vma is unlinked from its mm
+ */
 void ksm_remove_vma(struct vm_area_struct *vma)
 {
 	struct vma_slot *slot;
@@ -721,7 +723,8 @@ void ksm_remove_vma(struct vm_area_struct *vma)
 	spin_lock(&vma_slot_list_lock);
 	if (list_empty(&slot->slot_list)) {
 		/**
-		 * This slot has been added, so move to the del list
+		 * This slot has been added by ksmd, so move to the del list
+		 * waiting ksmd to free it.
 		 */
 		list_add_tail(&slot->slot_list, &vma_slot_del);
 	} else {
@@ -742,7 +745,7 @@ void ksm_remove_vma(struct vm_area_struct *vma)
 static u32 *random_nums;
 
 /* the number of unsigned long to be taken */
-static unsigned long current_sample_num = HASH_STRENGTH_FULL >> 4;
+static unsigned long hash_strength = HASH_STRENGTH_FULL >> 4;
 static unsigned long sample_num_delta = 0;
 #define SAMPLE_NUM_DELTA_MAX	5
 static u64 rshash_pos = 0;
@@ -1045,7 +1048,7 @@ static inline u32 calc_checksum_full(struct page *page, u32 checksum_old)
 	void *addr;
 
 	addr = kmap_atomic(page, KM_USER0);
-	checksum_full = delta_hash(addr, current_sample_num,
+	checksum_full = delta_hash(addr, hash_strength,
 				   HASH_STRENGTH_MAX, checksum_old);
 
 	kunmap_atomic(addr, KM_USER0);
@@ -1053,7 +1056,7 @@ static inline u32 calc_checksum_full(struct page *page, u32 checksum_old)
 	if (!checksum_full)
 		checksum_full = 1;
 
-	rshash_neg += (HASH_STRENGTH_MAX - current_sample_num);
+	rshash_neg += (HASH_STRENGTH_MAX - hash_strength);
 	return checksum_full;
 }
 
@@ -1075,7 +1078,7 @@ static inline int check_collision(struct rmap_item *rmap_item,
 	if (rmap_item->checksum_full) {
 		tmp = rshash_neg;
 		rshash_neg += memcmp_cost;
-		rshash_neg += (HASH_STRENGTH_MAX - current_sample_num);
+		rshash_neg += (HASH_STRENGTH_MAX - hash_strength);
 		BUG_ON(tmp > rshash_neg);
 
 	    if (rmap_item->checksum_full ==
@@ -1085,10 +1088,10 @@ static inline int check_collision(struct rmap_item *rmap_item,
 		    err = MERGE_ERR_CHANGED;
 	} else {
 		tmp = rshash_neg;
-		rshash_neg += memcmp_cost + current_sample_num;
+		rshash_neg += memcmp_cost + hash_strength;
 		BUG_ON(tmp > rshash_neg);
 
-		if (calc_checksum(page, current_sample_num, 0) == checksum_val)
+		if (calc_checksum(page, hash_strength, 0) == checksum_val)
 			err = MERGE_ERR_COLLI;
 		else
 			err = MERGE_ERR_CHANGED;
@@ -1323,9 +1326,9 @@ static int try_to_merge_two_pages(struct rmap_item *rmap_item,
 		goto out; /* success */
 
 	} else {
-		if (calc_checksum(page, current_sample_num, 0) ==
-		    calc_checksum(tree_page, current_sample_num, 0)) {
-			rshash_neg += memcmp_cost + current_sample_num * 2;
+		if (calc_checksum(page, hash_strength, 0) ==
+		    calc_checksum(tree_page, hash_strength, 0)) {
+			rshash_neg += memcmp_cost + hash_strength * 2;
 			err = MERGE_ERR_COLLI;
 		} else
 			err = MERGE_ERR_CHANGED;
@@ -1380,7 +1383,7 @@ static inline int checksum_cmp(u32 new_val, u32 node_val)
 static inline void checksum_copy2(u32 val, struct ksm_checksum *node_checksum)
 {
 	node_checksum->val = val;
-	node_checksum->sample_num = current_sample_num;
+	node_checksum->sample_num = hash_strength;
 
 	return;
 }
@@ -2219,7 +2222,7 @@ static void cmp_and_merge_page(struct rmap_item *rmap_item)
 	remove_rmap_item_from_tree(rmap_item);
 
 	page = rmap_item->page;
-	checksum_val = calc_checksum(page, current_sample_num, 1);
+	checksum_val = calc_checksum(page, hash_strength, 1);
 
 	ksm_pages_scanned++;
 
@@ -2898,24 +2901,24 @@ static unsigned long cal_dedup_ratio_clear(struct vma_slot *slot)
 	return ret;
 }
 
-static inline void inc_current_sample_num(unsigned long delta)
+static inline void inc_hash_strength(unsigned long delta)
 {
-	current_sample_num += 1 << delta;
-	if (current_sample_num > HASH_STRENGTH_MAX)
-		current_sample_num = HASH_STRENGTH_MAX;
-	//printk(KERN_ERR "KSM: current_sample_num inc to %lu\n", current_sample_num);
+	hash_strength += 1 << delta;
+	if (hash_strength > HASH_STRENGTH_MAX)
+		hash_strength = HASH_STRENGTH_MAX;
+	//printk(KERN_ERR "KSM: hash_strength inc to %lu\n", hash_strength);
 }
 
-static inline void dec_current_sample_num(unsigned long delta)
+static inline void dec_hash_strength(unsigned long delta)
 {
 	unsigned long change = 1 << delta;
 
-	if (current_sample_num <= change + 1)
-		current_sample_num = 1;
+	if (hash_strength <= change + 1)
+		hash_strength = 1;
 	else
-		current_sample_num -= change;
+		hash_strength -= change;
 
-	//printk(KERN_ERR "KSM: current_sample_num dec to %lu\n", current_sample_num);
+	//printk(KERN_ERR "KSM: hash_strength dec to %lu\n", hash_strength);
 }
 
 static inline void inc_sample_num_delta(void)
@@ -3174,11 +3177,11 @@ static inline void stable_tree_delta_hash(u32 prev_sample_num)
 			addr = kmap_atomic(node_page, KM_USER0);
 
 			checksum_val = delta_hash(addr, prev_sample_num,
-						  current_sample_num,
+						  hash_strength,
 						  checksum_val);
 			kunmap_atomic(addr, KM_USER0);
 		} else /* it was not inserted to rbtree due to last round collision. */
-			checksum_val = calc_checksum(node_page, current_sample_num, 0);
+			checksum_val = calc_checksum(node_page, hash_strength, 0);
 
 		stable_node_reinsert(node, node_page, root_new_treep,
 				     new_tree_node_listp, checksum_val);
@@ -3193,7 +3196,7 @@ static inline void stable_tree_delta_hash(u32 prev_sample_num)
 
 static inline void rshash_adjust(void)
 {
-	unsigned long prev_sample_num = current_sample_num;
+	unsigned long prev_sample_num = hash_strength;
 
 	if (ksm_pages_scanned == ksm_pages_scanned_last)
 		return;
@@ -3207,14 +3210,14 @@ static inline void rshash_adjust(void)
 
 	if (rshash_neg >= rshash_pos &&
 	    rshash_state.state == RSHASH_NEW) {
-		inc_current_sample_num(sample_num_delta);
+		inc_hash_strength(sample_num_delta);
 		inc_sample_num_delta();
 		goto out;
 	}
 
 	if (rshash_neg == 0 &&
 	    rshash_state.state == RSHASH_NEW) {
-		dec_current_sample_num(sample_num_delta);
+		dec_hash_strength(sample_num_delta);
 		inc_sample_num_delta();
 		goto out;
 	}
@@ -3230,7 +3233,7 @@ static inline void rshash_adjust(void)
 			if (rshash_state.pre_direct == GO_DOWN)
 				sample_num_delta = 0;
 
-			inc_current_sample_num(sample_num_delta);
+			inc_hash_strength(sample_num_delta);
 			inc_sample_num_delta();
 			rshash_state.stable_benefit = get_current_benefit();
 			rshash_state.pre_direct = GO_UP;
@@ -3240,21 +3243,21 @@ static inline void rshash_adjust(void)
 			if (rshash_state.pre_direct == GO_UP)
 				sample_num_delta = 0;
 
-			dec_current_sample_num(sample_num_delta);
+			dec_hash_strength(sample_num_delta);
 			inc_sample_num_delta();
 			rshash_state.stable_benefit = get_current_benefit();
 			rshash_state.pre_direct = GO_DOWN;
 			break;
 
 		case OBSCURE:
-			rshash_state.stable_point = current_sample_num;
-			rshash_state.turn_point_down = current_sample_num;
-			rshash_state.turn_point_up = current_sample_num;
+			rshash_state.stable_point = hash_strength;
+			rshash_state.turn_point_down = hash_strength;
+			rshash_state.turn_point_up = hash_strength;
 			rshash_state.turn_benefit_down = get_current_benefit();
 			rshash_state.turn_benefit_up = get_current_benefit();
 			rshash_state.lookup_window_index = 0;
 			rshash_state.state = RSHASH_TRYDOWN;
-			dec_current_sample_num(sample_num_delta);
+			dec_hash_strength(sample_num_delta);
 			inc_sample_num_delta();
 
 			break;
@@ -3274,15 +3277,15 @@ static inline void rshash_adjust(void)
 		if (get_current_benefit() < rshash_state.stable_benefit)
 			rshash_state.below_count++;
 		else if (get_current_benefit() > rshash_state.turn_benefit_down) {
-			rshash_state.turn_point_down = current_sample_num;
+			rshash_state.turn_point_down = hash_strength;
 			rshash_state.turn_benefit_down = get_current_benefit();
 		}
 
 		if (rshash_state.below_count >= 3 ||
 		    judge_rshash_direction() == GO_UP) {
-			current_sample_num = rshash_state.stable_point;
+			hash_strength = rshash_state.stable_point;
 			sample_num_delta = 0;
-			inc_current_sample_num(sample_num_delta);
+			inc_hash_strength(sample_num_delta);
 			inc_sample_num_delta();
 			rshash_state.lookup_window_index = 0;
 			rshash_state.state = RSHASH_TRYUP;
@@ -3292,7 +3295,7 @@ static inline void rshash_adjust(void)
 			       rshash_state.turn_point_down, rshash_state.turn_benefit_down);
 */
 		} else {
-			dec_current_sample_num(sample_num_delta);
+			dec_hash_strength(sample_num_delta);
 			inc_sample_num_delta();
 		}
 		break;
@@ -3305,23 +3308,23 @@ static inline void rshash_adjust(void)
 		if (get_current_benefit() < rshash_state.stable_benefit)
 			rshash_state.below_count++;
 		else if (get_current_benefit() > rshash_state.turn_benefit_up) {
-			rshash_state.turn_point_up = current_sample_num;
+			rshash_state.turn_point_up = hash_strength;
 			rshash_state.turn_benefit_up = get_current_benefit();
 		}
 
 		if (rshash_state.below_count >= 3 ||
 		    judge_rshash_direction() == GO_DOWN) {
-			current_sample_num = rshash_state.turn_benefit_up >
+			hash_strength = rshash_state.turn_benefit_up >
 			rshash_state.turn_benefit_down ? rshash_state.turn_point_up :
 			rshash_state.turn_point_down;
 			rshash_state.state = RSHASH_PRE_STILL;
 /*
-			printk(KERN_ERR "KSM: finished state TRYUP with turn_point=%lu benefit=%lu current_sample_num=%lu\n",
-			       rshash_state.turn_point_up, rshash_state.turn_benefit_up, current_sample_num);
+			printk(KERN_ERR "KSM: finished state TRYUP with turn_point=%lu benefit=%lu hash_strength=%lu\n",
+			       rshash_state.turn_point_up, rshash_state.turn_benefit_up, hash_strength);
 */
 
 		} else {
-			inc_current_sample_num(sample_num_delta);
+			inc_hash_strength(sample_num_delta);
 			inc_sample_num_delta();
 		}
 
@@ -3341,7 +3344,7 @@ static inline void rshash_adjust(void)
 
 	rshash_neg = rshash_pos = 0;
 
-	if (prev_sample_num != current_sample_num) {
+	if (prev_sample_num != hash_strength) {
 		//printk(KERN_ERR "KSM: rehash stable tree\n");
 		stable_tree_delta_hash(prev_sample_num);
 	}
@@ -4342,12 +4345,12 @@ static ssize_t pages_scanned_show(struct kobject *kobj,
 }
 KSM_ATTR_RO(pages_scanned);
 
-static ssize_t current_sample_num_show(struct kobject *kobj,
+static ssize_t hash_strength_show(struct kobject *kobj,
 				  struct kobj_attribute *attr, char *buf)
 {
-	return sprintf(buf, "%lu\n", current_sample_num);
+	return sprintf(buf, "%lu\n", hash_strength);
 }
-KSM_ATTR_RO(current_sample_num);
+KSM_ATTR_RO(hash_strength);
 
 static ssize_t sleep_times_show(struct kobject *kobj,
 				  struct kobj_attribute *attr, char *buf)
@@ -4367,7 +4370,7 @@ static struct attribute *ksm_attrs[] = {
 	&full_scans_attr.attr,
 	&min_scan_ratio_attr.attr,
 	&pages_scanned_attr.attr,
-	&current_sample_num_attr.attr,
+	&hash_strength_attr.attr,
 	&sleep_times_attr.attr,
 	&thrash_threshold_attr.attr,
 	NULL,
