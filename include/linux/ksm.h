@@ -165,11 +165,6 @@ struct vma_slot {
  *    compare it against the stable tree, and then against the unstable tree.)
  */
 
-struct ksm_checksum {
-	u32 sample_num;
-	u32 val;
-};
-
 
 /**
  * node of either the stable or unstale rbtree
@@ -178,7 +173,7 @@ struct ksm_checksum {
 struct tree_node {
 	struct rb_node node; /* link in the main (un)stable rbtree */
 	struct rb_root sub_root; /* rb_root for sublevel collision rbtree */
-	u32 checksum_val;
+	u32 hash;
 	unsigned long count; /* how many sublevel tree nodes */
 	struct list_head all_list; /* all tree nodes in stable/unstable tree */
 };
@@ -195,8 +190,7 @@ struct stable_node {
 	struct tree_node *tree_node; /* it's tree node root in stable tree, NULL if it's in hell list */
 	struct hlist_head hlist;
 	unsigned long kpfn;
-	//struct ksm_checksum checksum;
-	u32 checksum_full; /* if ==0 then it's not been calculated yet */
+	u32 hash_max; /* if ==0 then it's not been calculated yet */
 	//struct vm_area_struct *old_vma;
 	struct list_head all_list; /* in a list for all stable nodes */
 };
@@ -225,7 +219,6 @@ struct node_vma {
  * @anon_vma: pointer to anon_vma for this mm,address, when in stable tree
  * @mm: the memory structure this rmap_item is pointing into
  * @address: the virtual address this rmap_item tracks (+ flags in low bits)
- * @oldchecksum: previous checksum of the page at that virtual address
  * @node: rb node of this rmap_item in the unstable tree
  * @head: pointer to stable_node heading this list in the stable tree
  * @hlist: link into hlist of rmap_items hanging off that stable_node
@@ -244,7 +237,7 @@ struct rmap_item {
 		struct {/* when in unstable tree */
 			struct rb_node node;
 			struct tree_node *tree_node;
-			u32 checksum_full;
+			u32 hash_max;
 		};
 		struct { /* when in stable tree */
 			struct node_vma *head;
